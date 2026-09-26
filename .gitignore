@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+
+# 回归脚本的中间产物
+_tmp_*
+_fake_loras/
+
+.DS_Store

@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-josialab"
+version = "0.1.0"
+description = "JosiaNodes 实验包。用于临时节点与未定稿功能的独立试验田，与主节点包 ComfyUI_JosiaNodes 分离，节点可随意增删。目前含 Qwen-Image 2.1 加速 LoRA 适配器（JosiaQwenAccel），支持 Fun PDD 与 Viggle Turbo 两条加速路线。"
+authors = [{ name = "Josia-doit" }]
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["comfyui", "experimental", "josia"]
+classifiers = ["Framework :: ComfyUI"]
+dependencies = []
+
+[tool.comfy-node-pack]
+NodePackID = "comfyui-josialab"
+Name = "JosiaNodes Lab"
+Category = "⚡️Josia实验区"
