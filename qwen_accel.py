@@ -326,8 +326,37 @@ def _attach_mlp_hooks(mlp, gate, up, down):
     ]
 
 
+def _check_context_dim(model, context):
+    """
+    Qwen-Image-2.1 的 txt_in 只认固定宽度的 conditioning（context_in_dim，本模型是 4096）。
+    上游 CLIP 若配成 Qwen3-VL-32B（5120），会在 txt_in 的 rms_norm 里抛一句
+    「normalized_shape 对不上」的 torch 原文，看不出该改哪个控件。这里提前讲清楚。
+    """
+    if context is None or not hasattr(context, "shape"):
+        return
+    try:
+        expected = model.get_submodule("txt_in.text_norm").weight.shape[0]
+    except Exception:
+        return  # 不是这套结构就不插手，交给 ComfyUI 自己报错
+    if context.shape[-1] == expected:
+        return
+    raise ValueError(
+        f"[Josia实验/Qwen加速] 文本编码器的输出宽度和模型对不上：CLIP 送出 "
+        f"{context.shape[-1]} 维，而 Qwen-Image-2.1 的 txt_in 只认 {expected} 维。"
+        f"把上游「CLIP模型」换成 Qwen3_VL_8B 目录下的 "
+        f"qwen3.5_qwen_image_2.1_pe_i2i（带参考图）或 pe_t2i（纯文生图）那份。"
+    )
+
+
 def _run_with_lora(lora, executor, *args, **kwargs):
     dm = executor.class_obj
+    _check_context_dim(dm, args[2] if len(args) > 2 else None)
+    # LoRA 是从磁盘读进来的，躺在 CPU 上；这里把 A/B 搬到采样时那个张量所在的设备。
+    # ab 就是 lora 里的那个 list，原地赋值等于顺带更新了 lora（所以下方 hook 能直接拿到）。
+    device = args[0].device
+    for ab in lora.values():
+        if ab[0].device != device:
+            ab[0], ab[1] = ab[0].to(device), ab[1].to(device)
     hooks = []
     for name, ab in lora.items():
         parent, _, leaf = name.rpartition(".")
@@ -348,10 +377,35 @@ def _run_with_lora(lora, executor, *args, **kwargs):
             hook.remove()
 
 
+# 一个 turbo LoRA 奔 700MB，每次执行从头解一遍要 3-8 秒。
+# 按「真实路径 + mtime + 大小」记一层内存缓存：文件没被动就直接拿现成的，
+# 用户手改了 LoRA（mtime 变了）自动失效，不用重启 ComfyUI。
+_LORA_CACHE = {}
+_LORA_CACHE_LIMIT = 3
+
+
+def _load_lora(lora_path):
+    """读整个 LoRA，走一层内存缓存，返回 (state_dict, metadata)。"""
+    try:
+        st = os.stat(lora_path)
+    except OSError:
+        tag = None
+    else:
+        tag = (os.path.realpath(lora_path), st.st_mtime_ns, st.st_size)
+    if tag is not None and tag in _LORA_CACHE:
+        return _LORA_CACHE[tag]
+    sd, meta = comfy.utils.load_torch_file(lora_path, return_metadata=True)
+    if tag is not None:
+        _LORA_CACHE[tag] = (sd, meta)
+        while len(_LORA_CACHE) > _LORA_CACHE_LIMIT:
+            _LORA_CACHE.pop(next(iter(_LORA_CACHE)))
+    return sd, meta
+
+
 def _read_viggle_lora(lora_path):
     # 节点上没有强度这个参数，turbo 自家建议就是 1.0
     strength = 1.0
-    sd, meta = comfy.utils.load_torch_file(lora_path, return_metadata=True)
+    sd, meta = _load_lora(lora_path)
     cfg = json.loads(((meta or {}).get("lora_adapter_metadata") or "{}"))
     scale = strength * cfg.get("transformer.lora_alpha", 1) / cfg.get("transformer.r", 1)
 
@@ -360,12 +414,19 @@ def _read_viggle_lora(lora_path):
         if not key.endswith(".lora_A.weight"):
             continue
         base = key.removeprefix("transformer.").removesuffix(".lora_A.weight")
-        pair = (sd[key], sd[key.replace("lora_A", "lora_B")] * scale)
-        if pair[1].shape[0] != pair[0].shape[1]:
+        a = sd[key]
+        b = sd[key.replace("lora_A", "lora_B")] * scale
+        # 存 list 不存 tuple：设备对齐那段要原地改 ab[0]/ab[1]（跟官方 ViggleTurboLora 一致）。
+        # 成对判据只认 rank：A 是 (r, in)、B 是 (out, r)，两个 r 必须相等。
+        # 不能拿「B 的行数 == A 的列数」（也就是要求 in == out）当判据——那只是方阵才成立，
+        # 而 Qwen-Image 里 modulation（4096→16384）、img_mlp（4096→12288）、
+        # timestep_embedder.linear_1（256→4096）这类非方阵层占了全部层的四成多。
+        if a.shape[0] != b.shape[1]:
             raise ValueError(
-                f"[Josia实验/Qwen加速] {base} 的 A/B 形状对不上：{pair[0].shape} / {pair[1].shape}"
+                f"[Josia实验/Qwen加速] {base} 的 A/B 不是一对：A={tuple(a.shape)}（期望 rank "
+                f"{a.shape[0]}），B={tuple(b.shape)}（期望 rank {b.shape[1]}）"
             )
-        lora[base] = pair
+        lora[base] = [a, b]
     if not lora:
         raise ValueError(
             f"[Josia实验/Qwen加速] {os.path.basename(lora_path)} 里没有成对的 lora_A / lora_B，"
@@ -405,6 +466,7 @@ class _PDDHeadSelector:
         )
 
     def wrap(self, executor, x, timestep, *args, **kwargs):
+        _check_context_dim(executor.class_obj, args[0])
         values = timestep.detach().float().reshape(-1)
         sigma = values[0].item()
         index = min(range(4), key=lambda i: abs(self.sigmas[i] - sigma))
@@ -490,18 +552,16 @@ def apply_fun_pdd(model, lora_path):
             "（不是 2509 / 2511，也不是 Diffusers 转换的）。"
         )
     try:
-        with safe_open(lora_path, framework="pt", device="cpu") as handle:
-            meta = handle.metadata() or {}
+        sd, meta = _load_lora(lora_path)
     except Exception as exc:
         raise ValueError(f"[Josia实验/Qwen加速] 读不了 {os.path.basename(lora_path)}：{exc}")
-    if meta.get("format") != PDD_EXPORT_FORMAT:
+    if (meta or {}).get("format") != PDD_EXPORT_FORMAT:
         raise ValueError(
             f"[Josia实验/Qwen加速] {os.path.basename(lora_path)} 的 format="
             f"{meta.get('format')!r}，不是 Fun-Acc-4Step 导出。把「加速LoRA类型」切到 Viggle 试试？"
         )
 
-    state = load_file(lora_path, device="cpu")
-    patches, heads = _build_pdd_patches(model.model, state, lora_path)
+    patches, heads = _build_pdd_patches(model.model, sd, lora_path)
 
     clone = model.clone()
     applied = clone.add_patches(patches, strength_patch=1.0, strength_model=1.0)
@@ -515,8 +575,6 @@ def apply_fun_pdd(model, lora_path):
     clone.add_wrapper_with_key(
         comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, PDD_PATCH_KEY, selector.wrap
     )
-    # 对齐官方例子的 use_kv_cache=False，又不改动共享的基础模型
-    clone.model_options["transformer_options"]["qwen_image21_cache"] = {"device": "off"}
 
     return clone
 
