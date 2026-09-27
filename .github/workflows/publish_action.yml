@@ -14,11 +14,6 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
-      - name: 诊断密钥
-        env:
-          REGISTRY_ACCESS_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
-        run: echo "长度=${#REGISTRY_ACCESS_TOKEN}"
-
       - name: Publish Custom Node
         uses: Comfy-Org/publish-node-action@main
         with:
