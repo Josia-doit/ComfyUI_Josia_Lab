@@ -26,8 +26,8 @@ ComfyUI/custom_nodes/ComfyUI_Josia_Lab/
 
 | 控件 | 说明 |
 | --- | --- |
-| 选择LoRA | `loras` 目录下的 `.safetensors` 下拉。切类型会自动挑该类型的默认文件，手动换文件也可能反推出类型。 |
-| 加速LoRA类型 | `Fun PDD（4 步）` / `Viggle Turbo（6 步）`。切这里会连带换 LoRA 文件、采样器与 sigma。 |
+| 选择LoRA | `loras` 目录下的 `.safetensors` 下拉。选哪个文件就按上面那个类型怎么加载它；文件随便改名、换版本都不影响节点。 |
+| 加速LoRA类型 | `Fun PDD（4 步）` / `Viggle Turbo（6 步）`。切这里换加载方式、采样器与 sigma，不动你选的那个文件。 |
 | 采样器 | Fun PDD 一路只放开 euler；Viggle 可以另外试试。 |
 
 **可选输入**
@@ -48,7 +48,7 @@ ComfyUI/custom_nodes/ComfyUI_Josia_Lab/
   需要**原生 Qwen-Image-2.1 基础模型**（不是 2509 / 2511，也不是 Diffusers 转换的），
   不接受参考 Latent。
 
-- **Viggle Turbo（v0.2.1，6 步）**
+- **Viggle Turbo（6 步）**
   普通 LoRA，官方建议走 forward 旁路加载而不合并进权重（bf16 融合只剩约 70% 更新量，
   int8 再量化还会引入约 4 倍噪声），因此权重一格不动，用 hook 在 forward 后补上 LoRA 贡献。
   sigma 用的是官方 `ViggleTurboSigmas` 输入框那串 t 值，运行时按参考 Latent 的尺寸换算成真正的 sigma
@@ -57,7 +57,8 @@ ComfyUI/custom_nodes/ComfyUI_Josia_Lab/
 **接线要求**
 
 - 三个输出接 `SamplerCustom`，**CFG 保持 1**，不要接负面提示。
-- 用哪个类型就接哪个 LoRA；内置 sigma 已经与该类型绑定，不要从别处接 sigma 进去。
+- 用哪个类型就接哪个 LoRA；文件与类型的对应关系由你决定，节点不会替你换文件。
+- 内置 sigma 已经与该类型绑定，不要从别处接 sigma 进去 —— 缺文件、不配套时节点会直接点名报错。
 
 ## 目录结构
 

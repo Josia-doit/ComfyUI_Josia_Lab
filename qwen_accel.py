@@ -15,8 +15,9 @@ sigma 不做成选项，完全由「加速LoRA类型」在节点内部决定。
     只能走官方那套 patch 流程加载，采样器固定 euler，固定 4 个 sigma。
     它是写死的，所以不接受参考 Latent，sigma 用官方成品值。
 
-  · Viggle Turbo（Viggle / Qwen-Image-2.1-viggle-turbo，v0.2.1）
+  · Viggle Turbo（Viggle / Qwen-Image-2.1-viggle-turbo）
     普通 LoRA，官方节点走 forward 旁路加载（不合并进权重），6 步。
+    官方一直在重训改名（v0.2.1 → v0.3 …），所以节点不认文件名，文件由用户在下拉里选。
     官方 ViggleTurboSigmas 输入框里那串「t 值」不是 sigma，
     任何分辨率都填同一串，运行时按参考 Latent 的尺寸 shift 成真正的 sigma，
     末位补 0 再交给采样器。不接 Latent 就按 1024² 兜底。
@@ -58,10 +59,12 @@ LORA_SUBDIR = "QwenImage2.1"
 # AttributeError（dpm_2_a 在当前版本就已经不存在了）。
 SAMPLER_CHOICES = ["euler", "euler_ancestral", "heun", "dpm_2", "dpm_2_ancestral", "lcm"]
 
+# 这里只声明「类型 → 加载方式 / 采样器 / sigma」，不声明文件名：
+# 官方这类加速 LoRA 一直在换（0.2.1 → 0.3 → 未来的蒸馏版），文件名锁死只会把升级变成坏掉。
+# 文件一律由用户在「选择LoRA」下拉里自己挑，节点只保证「选了哪个文件就按选中的类型来加载它」。
 KINDS = {
     "fun_pdd": {
         "label": "Fun PDD（4 步）",
-        "file": "Qwen-Image-2.1-Fun-Acc-4Step.safetensors",
         # sigma 框里填的：官方 pdd_sigmas 成品，末位本来就是 0、长度是 steps+1
         "sigmas": [1.0, 0.9169867038726807, 0.7861579060554504, 0.5494909882545471, 0.0],
         "sigmas_note": "官方 pdd_sigmas 成品，最后一位是 0",
@@ -71,7 +74,6 @@ KINDS = {
     },
     "viggle": {
         "label": "Viggle Turbo（6 步）",
-        "file": "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors",
         # sigma 框里填的是官方 ViggleTurboSigmas 输入框那串「t 值」（官方叫 nodes）：
         # 它不是 sigma，通用就通用在这——任何分辨率都填同一串，运行时按参考 Latent
         # 的尺寸 shift 成真正的 sigma，末位再补 0
@@ -164,14 +166,13 @@ def _match_file(names, want):
     return None
 
 
-def default_lora_name(kind=None):
-    """按类型挑它自家那个文件（按尾部匹配）；都找不到就取列表第一项。"""
+def default_lora_name():
+    """
+    下拉默认值：只给一个「最可能用得上」的候选（列表第一项，QwenImage2.1/ 子目录被排在最前），
+    不按文件名认人 —— 官方加速 LoRA 一直在改名换版本，认文件名等于把升级做成坏掉。
+    真正生效的是用户在下拉里选中的那个文件。
+    """
     names = list_lora_files()
-    wanted = KINDS[kind]["file"] if kind in KINDS else None
-    if wanted:
-        hit = _match_file(names, wanted)
-        if hit:
-            return hit
     return names[0] if names else ""
 
 
@@ -517,9 +518,19 @@ def _build_pdd_patches(base_model, state, path):
         down, up = state[name + ".lora_down"], state[name + ".lora_up"]
         if (len(shape) != 2 or tuple(down.shape) != (PDD_RANK, shape[1])
                 or tuple(up.shape) != (shape[0], PDD_RANK)):
+            _lora_in = tuple(down.shape)[1]
+            _packed = (len(shape) == 2 and shape[1] > 0
+                       and _lora_in % shape[1] == 0 and _lora_in // shape[1] > 1)
+            if _packed:
+                raise ValueError(
+                    f"[Josia实验/Qwen加速] 当前基础模型是量化版，Fun PDD 加速 LoRA 用不了。"
+                    f"\n{name} 的基础权重被量化压成了 {shape[1]}（LoRA 要 {_lora_in}，"
+                    f"即 {_lora_in // shape[1]}:1 打包），加速 LoRA 只对原生满宽的 Qwen-Image-2.1 有效。"
+                    f"\n请换一个没量化的 Qwen-Image-2.1 基础模型再挂加速 LoRA。"
+                )
             raise ValueError(
                 f"[Josia实验/Qwen加速] {name} 的 LoRA/基础形状对不上："
-                f"down={tuple(down.shape)} up={tuple(up.shape)}"
+                f"down={tuple(down.shape)} up={tuple(up.shape)} base={shape}"
             )
         converted[name + ".lora_down.weight"] = down
         converted[name + ".lora_up.weight"] = up
@@ -597,14 +608,15 @@ class JosiaQwenAccel:
                 "选择LoRA": (
                     list_lora_files(),
                     {"default": default_lora_name(),
-                     "tooltip": "loras 目录里的 .safetensors。切类型会自动挑该类型的默认文件，"
-                                "手动换文件也可能反推出类型。"},
+                     "tooltip": "loras 目录里的 .safetensors。随便改名、换版本都不影响节点 —— "
+                                "选哪个文件就按上面那个类型怎么加载；类型与文件的对应关系由你决定。"},
                 ),
                 "加速LoRA类型": (
                     list(KIND_LABELS.values()),
                     {"default": KIND_LABELS["viggle"],
                      "tooltip": "Fun PDD（4 步）和 Viggle Turbo（6 步）的加载方式、采样器、sigma 都不一样，"
-                                "切这里会连带着换 LoRA 文件、采样器，sigma 也跟着换成这一路的官方值"},
+                                "切这里只换加载方式和 sigma，采样器按类型收敛（Fun PDD 只认 euler）；"
+                                "LoRA 文件不动，你选的那个照样按新类型走"},
                 ),
                 "采样器": (
                     SAMPLER_CHOICES,
@@ -658,7 +670,7 @@ class JosiaQwenAccel:
 
         name = str(kwargs.get("选择LoRA") or "").strip()
         if not name:
-            name = default_lora_name(kind)
+            name = default_lora_name()
         hit = _match_file(list_lora_files(), name) or (name if name in list_lora_files() else None)
         if hit is None:
             raise ValueError(

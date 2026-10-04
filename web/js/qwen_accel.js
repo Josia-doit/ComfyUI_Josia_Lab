@@ -3,19 +3,21 @@ import { app } from "../../scripts/app.js";
 const NODE_CLASS = "JosiaQwenAccel";
 
 /**
- * 与后端 KINDS 保持一致（只有 label / file 这两项会被前端用到）。
+ * 与后端 KINDS 保持一致（只同步 label 这一项）。
  * sigma 早就不是控件了 —— 节点内部按类型自己决定，切类型时连数值都不用改。
  * 控件名（选择LoRA / 加速LoRA类型 / 采样器）直接写在后端 INPUT_TYPES 的 key 上，
  * 前端只负责联动，不碰名字。
+ *
+ * 这里刻意不写文件名：官方加速 LoRA 一直在换版本改名（0.2.1 → 0.3 → 之后还会出蒸馏版），
+ * 前端跟着认文件名的话，用户一改名节点就「找不到官方文件」，纯属自找麻烦。
+ * 文件由用户在下拉里自己选，前端只保证「选中的文件 + 选中的类型」两件事对得上。
  */
 const KINDS = {
   fun_pdd: {
     label: "Fun PDD（4 步）",
-    file: "Qwen-Image-2.1-Fun-Acc-4Step.safetensors",
   },
   viggle: {
     label: "Viggle Turbo（6 步）",
-    file: "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors",
   },
 };
 
@@ -64,23 +66,12 @@ function matchFile(files, want) {
 }
 
 /**
- * 该类型的官方 LoRA 没在 loras 目录里时，往下拉里显式插一条「未找到」。
- * 不然下面 pickFile 会退化成 files[0] —— 用户以为在用加速 LoRA，
- * 实际加载的是列表里第一个不相干的文件，跑出来的图完全不是那回事。
+ * 保存下来的文件名已经不在列表里了（换机器、清过 loras、文件被改名）时的兜底：
+ * 给一个最可能用得上的候选（列表第一项，QwenImage2.1/ 子目录排最前），
+ * 由用户自己确认换到哪一个 —— 不偷偷退回别的文件，也不伪装成「未找到」。
  */
-function ensureMissingOption(widget, files, want) {
-  if (!widget) return null;
-  const values = Array.isArray(widget.options?.values) ? widget.options.values : [];
-  if (matchFile(values, want)) return null;
-  const label = `⚠ 未找到：${want}`;
-  if (!values.includes(label)) values.push(label);
-  return label;
-}
-
-/** 挑一个该类型该用的文件：官方文件 → 「未找到」提示项 → 列表第一项。 */
-function pickFile(files, kind, fileW) {
-  if (matchFile(files, KINDS[kind].file)) return matchFile(files, KINDS[kind].file);
-  return ensureMissingOption(fileW, files, KINDS[kind].file) ?? files[0] ?? "";
+function fallbackFile(files) {
+  return files[0] ?? "";
 }
 
 /** 文件名反推类型，和后端 guess_kind 同一套规则。 */
@@ -155,21 +146,36 @@ function sync(node, source = "init") {
     }
   }
 
-  // 3) 文件不在列表里就按当前类型挑一个（默认文件没下载 / 列表缓存过时都会走到这）
-  if (!matchFile(files, file)) {
-    file = pickFile(files, kind, fileW);
+  // 3) 没选过文件（新节点）才给个候选；选过但已经不在 loras 里（换机器 / 被删 / 被改名）
+  //    就原样留着 —— 偷偷替成列表第一项等于换了个不相干的 LoRA，出图跑偏还查不出原因。
+  //    留原值的另一个好处：执行时后端会点名报「找不到 LoRA：xxx」，用户一眼知道改啥。
+  if (!file) {
+    file = fallbackFile(files);
     setValue(node, fileW, file);
+  } else if (!matchFile(files, file)) {
+    console.warn(
+      `[Josia实验/Qwen加速] 选中的「${file}」不在 loras 里了（改名、删掉或换了机器？）。`
+      + `没有替你换成别的文件，请在「选择LoRA」里重选一个。`,
+    );
   }
 
   // 4) 采样器按类型收敛（Fun PDD 只认 euler）
   const allowed = SAMPLER_BY_KIND[kind] ?? SAMPLER_BY_KIND.viggle;
   if (!allowed.includes(samplerW?.value)) setValue(node, samplerW, "euler");
 
-  // 5) 主动切类型时，文件还挂着上一个类型的就换成新类型的默认文件
-  //    （sigma 不用管：它是节点内部按类型算的，切了类型数值自然就换了）
-  if (source === "kind" && guessKind(file) !== kind) {
-    file = pickFile(files, kind, fileW);
-    setValue(node, fileW, file);
+  // 5) 主动切类型时不换文件 —— 文件是你的选择，节点只管按上面那个类型去加载它。
+  //    万一选中的文件其实是另一路的（文件名能认出来的那种），控制台提一句，
+  //    由你自己决定是留着还是换一个：悄悄替你换，等于把「用哪个 LoRA」这个决定也收走了。
+  //    sigma 也不用管，它是节点内部按类型算的，切了类型数值自然就换了。
+  if (source === "kind") {
+    const guess = guessKind(file);
+    if (guess && guess !== kind) {
+      console.warn(
+        `[Josia实验/Qwen加速] 现在选的是「${file}」，看名字是 ${KINDS[guess].label} 那一路，`
+        + `但类型已切成「${KINDS[kind].label}」。没替你换文件 —— 加载方式会对不上，`
+        + `要的话请在「选择LoRA」里手动换一个。`,
+      );
+    }
   }
 
   node.setDirtyCanvas?.(true, true);
@@ -236,6 +242,6 @@ window.__josiaQwenAccel = {
   KIND_KEYS,
   guessKind,
   matchFile,
-  pickFile,
+  fallbackFile,
   sync,
 };
