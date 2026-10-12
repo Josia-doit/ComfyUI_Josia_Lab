@@ -26,9 +26,9 @@ ComfyUI/custom_nodes/ComfyUI_Josia_Lab/
 
 | 控件 | 说明 |
 | --- | --- |
-| 选择LoRA | `loras` 目录下的 `.safetensors` 下拉。选哪个文件就按上面那个类型怎么加载它；文件随便改名、换版本都不影响节点。 |
-| 加速LoRA类型 | `Fun PDD（4 步）` / `Viggle Turbo（6 步）`。切这里换加载方式、采样器与 sigma，不动你选的那个文件。 |
-| 采样器 | Fun PDD 一路只放开 euler；Viggle 可以另外试试。 |
+| 选择LoRA | `loras` 目录下的 `.safetensors` 下拉；最上面常驻一项「使用官方 Qwen Image 2.1 Turbo 模型（不挂 LoRA）」是特例，选它不加载任何 LoRA。其它文件选哪个就按上面那个类型怎么加载它；文件随便改名、换版本都不影响节点。 |
+| 加速LoRA类型 | `Fun PDD（4 步）` / `Viggle Turbo（6 步）` / `官方 Turbo（8 步）`。切这里换加载方式、采样器与 sigma，不动你选的那个文件。 |
+| 采样器 | Fun PDD 与官方 Turbo 都只放开 euler；Viggle 可以另外试试。 |
 
 **可选输入**
 
@@ -36,7 +36,7 @@ ComfyUI/custom_nodes/ComfyUI_Josia_Lab/
 | --- | --- |
 | model | 选填。不接就只把采样器与 sigma 传下去，方便单独接一个预览节点看数值。 |
 | sigmas | 选填。不接就按类型用内置的那套；接进来的 SIGMAS 优先。 |
-| latent | 选填。喂给采样器的那个 latent，Viggle 用它按分辨率换算 sigma；Fun PDD 无视它。 |
+| latent | 选填。喂给采样器的那个 latent，Viggle 用它按分辨率换算 sigma；Fun PDD 与官方 Turbo 无视它。 |
 
 **输出**：`model` / `sampler` / `sigmas`
 
@@ -53,6 +53,12 @@ ComfyUI/custom_nodes/ComfyUI_Josia_Lab/
   int8 再量化还会引入约 4 倍噪声），因此权重一格不动，用 hook 在 forward 后补上 LoRA 贡献。
   sigma 用的是官方 `ViggleTurboSigmas` 输入框那串 t 值，运行时按参考 Latent 的尺寸换算成真正的 sigma
   （末位补 0），不接 Latent 就按 1024² 兜底。
+
+- **官方 Turbo（8 步）**
+  不是 LoRA，是 Qwen 官方发布的 Qwen-Image-2.1-Turbo 检查点。在「选择LoRA」里选最上面那项
+  「使用官方 Qwen Image 2.1 Turbo 模型（不挂 LoRA）」，就等于把官方 Turbo 检查点当基础模型、
+  节点不加载任何 LoRA，只把 model 原样透传、把官方 8 步 sigma（检查点 `model_index.json` 里的
+  `sample_sigmas`，末位补 0 凑 8 步）和 euler 采样器交给下游。CFG 保持 1、不要负面提示。
 
 **接线要求**
 

@@ -3,6 +3,12 @@ import { app } from "../../scripts/app.js";
 const NODE_CLASS = "JosiaQwenAccel";
 
 /**
+ * 与后端 TURBO_SENTINEL 必须完全一致：选它 = 用官方 Qwen-Image-2.1-Turbo 检查点当基础模型、
+ * 不挂任何 LoRA。后端 apply() 里拿它当哨兵认官方 Turbo 这一路，前后端字符串对不上就会认错路。
+ */
+const TURBO_SENTINEL = "使用官方 Qwen Image 2.1 Turbo 模型（不挂 LoRA）";
+
+/**
  * 与后端 KINDS 保持一致（只同步 label 这一项）。
  * sigma 早就不是控件了 —— 节点内部按类型自己决定，切类型时连数值都不用改。
  * 控件名（选择LoRA / 加速LoRA类型 / 采样器）直接写在后端 INPUT_TYPES 的 key 上，
@@ -19,6 +25,11 @@ const KINDS = {
   viggle: {
     label: "Viggle Turbo（6 步）",
   },
+  official_turbo: {
+    label: "官方 Turbo（8 步）",
+    // 不选任何 LoRA 文件：用官方 Turbo 检查点当基础模型，model 原样透传
+    no_lora: true,
+  },
 };
 
 const KIND_KEYS = Object.keys(KINDS);
@@ -29,7 +40,7 @@ const KIND_BY_LABEL = Object.fromEntries(
   KIND_KEYS.map((k) => [KINDS[k].label, k]),
 );
 
-/** 与后端 KINDS[kind]["samplers"] 一致：Fun PDD 那一路只认 euler。 */
+/** 与后端 KINDS[kind]["samplers"] 一致：Fun PDD 与官方 Turbo 都只认 euler。 */
 const SAMPLER_BY_KIND = {
   fun_pdd: ["euler"],
   viggle: [
@@ -40,6 +51,7 @@ const SAMPLER_BY_KIND = {
     "dpm_2_ancestral",
     "lcm",
   ],
+  official_turbo: ["euler"],
 };
 
 function kindKey(raw) {
@@ -131,14 +143,29 @@ function sync(node, source = "init") {
   const samplerW = findWidget(node, "采样器");
   const files = fileOptions(node);
 
+  let file = String(fileW?.value ?? "");
+
+  // 0) 选了「用官方 Turbo 模型」哨兵项 → 类型也强制切到官方 Turbo（双向联动的一半）
+  if (file === TURBO_SENTINEL) {
+    setValue(node, kindW, KINDS.official_turbo.label);
+  }
+
   // 1) 类型：下拉里存的是标签，这里认回内部 key（旧工作流存的 key 也认）
   let kind = kindKey(kindW?.value);
   setValue(node, kindW, KINDS[kind].label);
 
-  // 2) 换文件时按文件名反推类型 —— 必须用当前这个文件名反推，
-  //    不能等下面把它重挑成默认文件再反推，否则永远反推不出来
-  let file = String(fileW?.value ?? "");
-  if (source !== "kind") {
+  // 2) 官方 Turbo 模式：不挂 LoRA，文件框锁到哨兵项、采样器收敛 euler，跳过选文件那套
+  if (kind === "official_turbo") {
+    setValue(node, fileW, TURBO_SENTINEL);
+    const allowed = SAMPLER_BY_KIND.official_turbo;
+    if (!allowed.includes(samplerW?.value)) setValue(node, samplerW, "euler");
+    node.setDirtyCanvas?.(true, true);
+    return;
+  }
+
+  // 3) 换文件时按文件名反推类型 —— 必须用当前这个文件名反推，
+  //    不能等下面把它重挑成默认文件再反推，否则永远反推不出来（哨兵项认不出类型，跳过）
+  if (source !== "kind" && file !== TURBO_SENTINEL) {
     const guess = guessKind(file);
     if (guess && guess !== kind) {
       kind = guess;
@@ -146,10 +173,10 @@ function sync(node, source = "init") {
     }
   }
 
-  // 3) 没选过文件（新节点）才给个候选；选过但已经不在 loras 里（换机器 / 被删 / 被改名）
-  //    就原样留着 —— 偷偷替成列表第一项等于换了个不相干的 LoRA，出图跑偏还查不出原因。
-  //    留原值的另一个好处：执行时后端会点名报「找不到 LoRA：xxx」，用户一眼知道改啥。
-  if (!file) {
+  // 4) 没选过文件（新节点）或刚从官方 Turbo 切走（还停在哨兵项）才给个候选；
+  //    选过但已经不在 loras 里（换机器 / 被删 / 被改名）就原样留着 ——
+  //    偷偷替成列表第一项等于换了个不相干的 LoRA，出图跑偏还查不出原因。
+  if (!file || file === TURBO_SENTINEL) {
     file = fallbackFile(files);
     setValue(node, fileW, file);
   } else if (!matchFile(files, file)) {
@@ -159,11 +186,11 @@ function sync(node, source = "init") {
     );
   }
 
-  // 4) 采样器按类型收敛（Fun PDD 只认 euler）
+  // 5) 采样器按类型收敛（Fun PDD 只认 euler）
   const allowed = SAMPLER_BY_KIND[kind] ?? SAMPLER_BY_KIND.viggle;
   if (!allowed.includes(samplerW?.value)) setValue(node, samplerW, "euler");
 
-  // 5) 主动切类型时不换文件 —— 文件是你的选择，节点只管按上面那个类型去加载它。
+  // 6) 主动切类型时不换文件 —— 文件是你的选择，节点只管按上面那个类型去加载它。
   //    万一选中的文件其实是另一路的（文件名能认出来的那种），控制台提一句，
   //    由你自己决定是留着还是换一个：悄悄替你换，等于把「用哪个 LoRA」这个决定也收走了。
   //    sigma 也不用管，它是节点内部按类型算的，切了类型数值自然就换了。
@@ -237,6 +264,7 @@ app.registerExtension({
 
 // 调试用：控制台敲 window.__josiaQwenAccel 看当前类型配置
 window.__josiaQwenAccel = {
+  TURBO_SENTINEL,
   KINDS,
   KIND_LABELS,
   KIND_KEYS,

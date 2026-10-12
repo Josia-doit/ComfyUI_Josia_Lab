@@ -25,6 +25,13 @@ sigma 不做成选项，完全由「加速LoRA类型」在节点内部决定。
 Viggle 为什么不用 LoraLoaderModelOnly 合并：官方源码注释写明，bf16 下
 round-to-nearest 只剩约 70% 的更新量，int8 再量化还会引入约 4 倍体积的噪声，
 所以保持 unmerged（y = Wx + B·A·x），权重一格不动。
+
+官方 Turbo（Qwen-Image-2.1-Turbo，8 步）是另一条路：它是一份独立的官方检查点，
+不是 LoRA。选「使用官方 Qwen Image 2.1 Turbo 模型（不挂 LoRA）」= 用这份检查点当基础模型、
+节点不加载任何 LoRA，model 原样透传，只把官方 8 步 sigma（model_index.json 里的
+sample_sigmas：1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0）
+和 euler 采样器喂给下游。CFG 保持 1、不要负面提示。这份 schedule 是官方训出来的，
+别的调度器官方没评估过，所以采样器锁死 euler。
 """
 
 import json
@@ -51,6 +58,10 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 # 这两个 LoRA 一直放在 loras/ 下的这个子目录里
 LORA_SUBDIR = "QwenImage2.1"
+
+# 「选择LoRA」下拉里最前面那项常驻哨兵：选它 = 用官方 Qwen-Image-2.1-Turbo 检查点
+# 当基础模型、不挂任何 LoRA。节点只输出官方 8 步 sigma + 采样器。前后端必须用同一个字符串。
+TURBO_SENTINEL = "使用官方 Qwen Image 2.1 Turbo 模型（不挂 LoRA）"
 
 # Fun PDD 官方那个「固定 euler」在数值上就是普通 euler（源码里最后一行是
 # sample_euler，额外只多一道 sigma 校验和一次 .float()），所以这里直接给下拉选。
@@ -82,6 +93,18 @@ KINDS = {
         "sigmas_kind": "nodes",
         "samplers": SAMPLER_CHOICES,
         "needs_latent": True,
+    },
+    "official_turbo": {
+        "label": "官方 Turbo（8 步）",
+        # 官方 Qwen-Image-2.1-Turbo 检查点的 sample_sigmas（model_index.json 里那串），
+        # 已对官方仓库核实：9 个值、末位补 0 凑成 8 步。选这个类型 = 不挂 LoRA，
+        # model 原样透传（用户已加载官方 Turbo 检查点），节点只负责把官方 sigma 喂给采样器。
+        "sigmas": [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0],
+        "sigmas_note": "官方 Qwen-Image-2.1-Turbo 的 sample_sigmas，9 个值、末位 0",
+        "sigmas_kind": "final",
+        "samplers": ["euler"],
+        "needs_latent": False,
+        "no_lora": True,
     },
 }
 
@@ -170,10 +193,19 @@ def default_lora_name():
     """
     下拉默认值：只给一个「最可能用得上」的候选（列表第一项，QwenImage2.1/ 子目录被排在最前），
     不按文件名认人 —— 官方加速 LoRA 一直在改名换版本，认文件名等于把升级做成坏掉。
-    真正生效的是用户在下拉里选中的那个文件。
+    真正生效的是用户在下拉里选中的那个文件。没有任何 LoRA 文件时，默认落到官方 Turbo 哨兵项
+    （用官方检查点、不挂 LoRA），保证下拉永远有个合法默认值。
     """
     names = list_lora_files()
-    return names[0] if names else ""
+    return names[0] if names else TURBO_SENTINEL
+
+
+def lora_file_choices():
+    """
+    「选择LoRA」下拉的全部选项：常驻哨兵项排在最前，后面才是真实文件。
+    哨兵项 = 用官方 Qwen-Image-2.1-Turbo 检查点（不挂 LoRA）；连一个 LoRA 文件都没有时它也能选。
+    """
+    return [TURBO_SENTINEL] + list_lora_files()
 
 
 def resolve_lora(lora_name):
@@ -606,17 +638,20 @@ class JosiaQwenAccel:
         return {
             "required": {
                 "选择LoRA": (
-                    list_lora_files(),
+                    lora_file_choices(),
                     {"default": default_lora_name(),
                      "tooltip": "loras 目录里的 .safetensors。随便改名、换版本都不影响节点 —— "
-                                "选哪个文件就按上面那个类型怎么加载；类型与文件的对应关系由你决定。"},
+                                "选哪个文件就按上面那个类型怎么加载；类型与文件的对应关系由你决定。"
+                                "最上面那项「使用官方 Qwen Image 2.1 Turbo 模型（不挂 LoRA）」是特例："
+                                "选它 = 用官方 Turbo 检查点当基础模型、不挂任何 LoRA，节点只输出官方 8 步 sigma 和采样器。"},
                 ),
                 "加速LoRA类型": (
                     list(KIND_LABELS.values()),
                     {"default": KIND_LABELS["viggle"],
-                     "tooltip": "Fun PDD（4 步）和 Viggle Turbo（6 步）的加载方式、采样器、sigma 都不一样，"
-                                "切这里只换加载方式和 sigma，采样器按类型收敛（Fun PDD 只认 euler）；"
-                                "LoRA 文件不动，你选的那个照样按新类型走"},
+                     "tooltip": "Fun PDD（4 步）、Viggle Turbo（6 步）的加载方式、采样器、sigma 都不一样；"
+                                "官方 Turbo（8 步）是特例 —— 不挂 LoRA，用官方 Turbo 检查点当基础模型，"
+                                "节点只出官方 8 步 sigma。切这里只换加载方式和 sigma，采样器按类型收敛"
+                                "（Fun PDD 和官方 Turbo 都只认 euler）；LoRA 文件不动，你选的那个照样按新类型走"},
                 ),
                 "采样器": (
                     SAMPLER_CHOICES,
@@ -659,25 +694,34 @@ class JosiaQwenAccel:
         "节点自动换上对应的加载方式、采样器与 sigma，sigma 不用自己填。"
         "Fun PDD（4 步）用官方 sigma 成品，不接受参考 Latent；"
         "Viggle Turbo（6 步）按官方那串 t 值走，接上参考 Latent 会按分辨率换算成真正的 sigma，"
-        "不接就按 1024² 算。三个输出接 SamplerCustom，CFG 保持 1、不要负面提示。"
+        "不接就按 1024² 算；官方 Turbo（8 步）是特例 —— 选「使用官方 Qwen Image 2.1 Turbo 模型"
+        "（不挂 LoRA）」用官方检查点当基础模型，不加载任何 LoRA，节点只出官方 8 步 sigma。"
+        "三个输出接 SamplerCustom，CFG 保持 1、不要负面提示。"
     )
 
     # 控件 key 是中文，直接用 kwargs 接，名字对得上 INPUT_TYPES 就行
     def apply(self, **kwargs):
         model = kwargs.get("model")  # 可选输入，不接就是 None
         kind = resolve_kind(kwargs.get("加速LoRA类型"))
+        # 选了「使用官方 Turbo 模型」哨兵项 = 不挂 LoRA，直接走官方 Turbo 这一路
+        if str(kwargs.get("选择LoRA") or "").strip() == TURBO_SENTINEL:
+            kind = "official_turbo"
         info = KINDS[kind]
 
-        name = str(kwargs.get("选择LoRA") or "").strip()
-        if not name:
-            name = default_lora_name()
-        hit = _match_file(list_lora_files(), name) or (name if name in list_lora_files() else None)
-        if hit is None:
-            raise ValueError(
-                f"[Josia实验/Qwen加速] 找不到 LoRA：{name}\n"
-                f"把它放进 ComfyUI 的 loras/{LORA_SUBDIR}/ 目录。"
-            )
-        path = resolve_lora(hit)
+        # 官方 Turbo：不读任何 LoRA 文件，model 原样透传（用户已加载官方 Turbo 检查点）
+        if kind == "official_turbo":
+            path = None
+        else:
+            name = str(kwargs.get("选择LoRA") or "").strip()
+            if not name:
+                name = default_lora_name()
+            hit = _match_file(list_lora_files(), name) or (name if name in list_lora_files() else None)
+            if hit is None:
+                raise ValueError(
+                    f"[Josia实验/Qwen加速] 找不到 LoRA：{name}\n"
+                    f"把它放进 ComfyUI 的 loras/{LORA_SUBDIR}/ 目录。"
+                )
+            path = resolve_lora(hit)
 
         sampler = kwargs.get("采样器")
         allowed = info["samplers"]
@@ -698,6 +742,8 @@ class JosiaQwenAccel:
 
         if model is None:
             patched = None  # 没接模型就不打补丁，sigma / 采样器照样出
+        elif kind == "official_turbo":
+            patched = model  # 原样透传：用官方 Turbo 检查点当基础模型，不挂 LoRA
         else:
             patched = apply_fun_pdd(model, path) if kind == "fun_pdd" else apply_viggle(model, path)
         return (patched, comfy.samplers.ksampler(sampler, {}), sigmas)

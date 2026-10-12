@@ -1,5 +1,19 @@
 # 更新日志
 
+## 0.1.2 - 2026-10-12
+
+### JosiaQwenAccel · QwenImage2.1 加速 LoRA 适配器
+
+- **新增「官方 Turbo（8 步）」这条路**：Qwen 官方发布了 Qwen-Image-2.1-Turbo 检查点（不是 LoRA）。
+  「选择LoRA」下拉最上面多了一个常驻项「使用官方 Qwen Image 2.1 Turbo 模型（不挂 LoRA）」，
+  选它 = 用官方 Turbo 检查点当基础模型、不加载任何 LoRA，节点把 model 原样透传，只输出官方 8 步 sigma
+  和 euler 采样器。
+- 这根官方的 sigma 就是从检查点 `model_index.json` 里读出来的 `sample_sigmas`
+  （1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568，末位补 0 凑 8 步），
+  已对官方仓库核实。它和 Fun PDD 一样锁死 euler、CFG 保持 1、不要负面提示。
+- 「选择LoRA」选哨兵项和「加速LoRA类型」选「官方 Turbo（8 步）」双向联动：任一选中都进入不挂 LoRA 模式，
+  采样器自动收敛 euler；从这条路切回其它类型时，文件框会自动回到真实 LoRA 文件。
+
 ## 0.1.1 - 2026-10-04
 
 ### JosiaQwenAccel · QwenImage2.1 加速 LoRA 适配器
