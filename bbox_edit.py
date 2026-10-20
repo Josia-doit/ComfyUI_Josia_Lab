@@ -5,8 +5,8 @@ Josia框选编辑（实验包）—— 经典模式（1.0）下的「创建边�
 BOUNDING_BOXES 自定义控件，由 Vue 组件渲染成一块画布。经典 LiteGraph 前端
 不认识这个控件类型，只会留一片空白，没法画框。
 
-这里换一条路：框编辑器由本包自己的前端用 DOM 面板 + canvas 实现（经典模式
-下完全可控），框数据以 JSON 字符串落进一个隐藏控件交给后端。后端解析后
+这里换一条路：框编辑器由本包自己的前端**内嵌在节点面板里**实现（DOM + canvas，
+经典模式下完全可控），框数据以 JSON 字符串落进一个隐藏控件交给后端。后端解析后
 **原样产出官方那三种数据格式**，所以下游（Flux 3 Image / MOSS-Image Layout
 Prompt / Layers 等）照接不误。
 
@@ -23,10 +23,16 @@ nodes_bounding_boxes.py）：
 """
 
 import json
+import os
 
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+
+try:
+    import folder_paths
+except ImportError:      # 脱离 ComfyUI 环境做单测时兜底
+    folder_paths = None
 
 NODE_CLASS = "JosiaBBoxEdit"
 NODE_DISPLAY_NAME = "Josia框选编辑"
@@ -44,6 +50,51 @@ STATE = "框数据"
 
 MAX_DIM = 16384
 MIN_DIM = 64
+
+# 「选择图像」控件的空选项与判定集合：选中它们 ＝ 无图像来源，画布走面板分辨率
+IMAGE_PLACEHOLDER = "🖼️请选择或上传图像…"
+_EMPTY_IMAGE_VALUES = ("", IMAGE_PLACEHOLDER)
+
+
+def _input_image_choices() -> list:
+    """「选择图像」下拉候选：input 目录里的图像文件（含子目录），空选项恒在首位。
+
+    🔴 必须**递归**子目录 + 用 `filter_files_content_types` 过滤：
+    这版 ComfyUI 的 `folder_paths.get_filename_list("input")` 会抛 `KeyError: 'input'`
+    （"input" 不再是注册的 folder type），直接退化成只剩占位符。照搬主包图像编码的
+    `os.walk + filter_files_content_types` 写法，既能列到 input 全量图像、又避免 2.0
+    资产体系重构后的 KeyError。候选用相对 input 的路径（正斜杠），与
+    `get_annotated_filepath` / 原生 LoadImage 口径一致。
+    """
+    choices = [IMAGE_PLACEHOLDER]
+    if folder_paths is None:
+        return choices
+    try:
+        input_dir = folder_paths.get_input_directory()
+        files = []
+        for root, _dirs, names in os.walk(input_dir):
+            for n in names:
+                rel = os.path.relpath(os.path.join(root, n), input_dir)
+                files.append(rel.replace("\\", "/"))
+        files = folder_paths.filter_files_content_types(files, ["image"])
+        choices += sorted(files, key=str.lower)
+    except Exception:
+        pass
+    return choices
+
+
+def _load_bg_file(name: str):
+    """按「选择图像」的值加载 input 目录图像，返回 PIL RGB 图；取不到就返回 None。"""
+    if folder_paths is None:
+        return None
+    try:
+        path = folder_paths.get_annotated_filepath(name)
+        if not path or not os.path.isfile(path):
+            return None
+        with Image.open(path) as im:
+            return im.convert("RGB")
+    except Exception:
+        return None
 
 
 # ============================ 坐标换算（与官方逐行对齐）============================
@@ -365,14 +416,26 @@ class JosiaBBoxEdit:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                # 面板分辨率：只在**没有图像来源**时用来当画布尺寸（画框的坐标网格）；
+                # 一旦有图像（上传或接上游），画布与坐标全部按图像尺寸走，这两项在前端灰化。
                 WIDTH: ("INT", {"default": 1024, "min": MIN_DIM, "max": MAX_DIM, "step": 16}),
                 HEIGHT: ("INT", {"default": 1024, "min": MIN_DIM, "max": MAX_DIM, "step": 16}),
                 # 前端把框数据写成 JSON 存这里。隐藏控件，但仍然是执行必需项，
                 # 这样每次执行都会把当前编辑结果带进后端，不需要额外缓存机制。
                 STATE: ("STRING", {"default": "[]", "multiline": True}),
+                # 「选择图像」：input 目录图像下拉（原生 image_upload ＝ 控件右侧的
+                # 「点击上传图像」按钮，与图像编码节点同款样式）。上传后文件名自动进本下拉。
+                # 空选项 ＝ 无图像来源；「底图」端口接线时前端会把本项灰化（端口优先）。
+                "image": (_input_image_choices(), {
+                    "default": IMAGE_PLACEHOLDER,
+                    "image_upload": True,
+                    "tooltip": "从 input 目录选一张图当画布底图，或点控件右侧的上传按钮传图。\n"
+                               "有图像时：画布与坐标按图像尺寸走，上方分辨率自动灰化。\n"
+                               "「底图」端口接线时本项自动灰化 —— 端口优先。",
+                }),
             },
             "optional": {
-                "底图": ("IMAGE",),
+                "底图": ("IMAGE", {"tooltip": "接上游图像当画布底图：实时显示上游预览，画布与坐标按图像尺寸走。"}),
             },
         }
 
@@ -382,24 +445,26 @@ class JosiaBBoxEdit:
     FUNCTION = "run"
     CATEGORY = NODE_CATEGORY
 
-    def run(self, 画布宽度=1024, 画布高度=1024, 框数据="[]", 底图=None):
-        width = _dims(画布宽度, 1024)
-        height = _dims(画布高度, 1024)
+    def run(self, 画布宽度=1024, 画布高度=1024, 框数据="[]", image=IMAGE_PLACEHOLDER, 底图=None):
+        # 底图来源二选一，端口优先：①「底图」端口（上游图像 tensor）②「选择图像」文件。
+        # 有底图 ⇒ 画布与坐标一律按底图尺寸走（面板分辨率自动失效）；都没有 ⇒ 面板分辨率。
+        bg = _bg_from_image(底图)
+        if bg is None and str(image or "").strip() not in _EMPTY_IMAGE_VALUES:
+            bg = _load_bg_file(image)
+        if bg is not None:
+            width, height = bg.size
+        else:
+            width = _dims(画布宽度, 1024)
+            height = _dims(画布高度, 1024)
         regions = parse_regions(框数据)
 
-        preview = render_preview(regions, width, height, _bg_from_image(底图))
+        preview = render_preview(regions, width, height, bg)
         elements = build_elements(regions)
 
+        # 预览图只在内嵌画布（节点面板里的编辑器）实时显示，不在节点底部再渲染一张
+        # 冗余缩略图（那张图与画布内容重复、且极易被误认成「上传后多出的无用预览」）。
+        # 下游仍可正常接「预览图」输出端口：这里只去掉 ui.images 的节点体预览，不动 result。
         ui = {"dims": [width, height], "regions": regions}
-        # 经典模式（1.0 前端）不会把「输出节点返回的 IMAGE 输出」自动显示成缩略图——
-        # 那是 2.0 前端才有的能力。这里照官方节点给 background 存图的同一手法，
-        # 把预览图转成临时图塞进 ui.images，经典前端才会在节点上显示缩略图。
-        # lazy import + try 兜底：缩略图存失败也绝不影响框数据产出。
-        try:
-            import nodes
-            ui["images"] = nodes.PreviewImage().save_images(preview, "comfy.bboxes.preview")["ui"]["images"]
-        except Exception:
-            pass
         return {
             "ui": ui,
             "result": (preview, build_bboxes(regions, width, height), elements, json.dumps(elements, ensure_ascii=False)),

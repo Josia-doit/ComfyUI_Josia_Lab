@@ -1,16 +1,27 @@
 /**
- * Josia框选编辑 —— 经典模式（1.0）下的边界框编辑器前端。
+ * Josia框选编辑 —— 经典模式（1.0）下的「创建边界框」平替：编辑器内嵌在节点面板里。
  *
  * 官方那个「创建边界框」只在 2.0 前端能用：它的框编辑器是 V3 schema 的
  * BOUNDING_BOXES 控件，由 Vue 组件渲染，经典 LiteGraph 前端不认识这个控件类型。
- * 这里改用「DOM 面板 + 原生 canvas」自己实现，经典模式下完全可控。
+ * 这里用「节点内嵌 DOM + 原生 canvas」自己实现，经典模式下完全可控。
  *
- * 数据流：面板里编辑框 → 序列化成 JSON → 写进隐藏的「框数据」控件 → 后端解析。
+ * 节点布局（自上而下）：
+ *   画布宽度 / 画布高度 / 选择图像（combo）  ← 标准控件
+ *   内嵌编辑器（一个 DOM widget）：
+ *     [⬆ 上传图像] → [状态行 + ＋/🗑/清空] → 画布（有图＝变暗的图，无图＝网格）
+ *     → 胶囊开关（物体|文字）→ 文字 / 描述 / 颜色 / 位置 → 框列表
+ *
+ * 图像来源（二选一，端口优先）：
+ *   · 「选择图像」下拉（内部键名 image）：input 目录图像文件；「⬆ 上传图像」上传后进本下拉
+ *   · 「底图」输入端口：实时显示上游节点的预览图（上游 imgs 一变就跟着刷）
+ * 有图像 ⇒ 画布/坐标按图像尺寸走，画布宽度/高度灰化；无图像 ⇒ 按面板分辨率画网格画布。
+ *
+ * 数据流：编辑框 → 序列化成 JSON → 写进隐藏的「框数据」控件 → 后端解析。
  * 落盘的 JSON 与官方编辑器状态同构：[{x,y,w,h,type,text,desc,palette}]，坐标是 0~1 分数。
- *
  * 框的顺序即层级：官方注释写明「背景元素先放、前景最后放」，这里沿用同一约定。
  */
 import { app } from "../../../scripts/app.js";
+import { api } from "../../../scripts/api.js";
 
 const NODE_CLASS = "JosiaBBoxEdit";
 
@@ -18,74 +29,92 @@ const NODE_CLASS = "JosiaBBoxEdit";
 const W_WIDTH = "画布宽度";
 const W_HEIGHT = "画布高度";
 const W_STATE = "框数据";
+const W_IMAGE = "image";
+const PORT_BG = "底图";
+const IMAGE_PLACEHOLDER = "🖼️请选择或上传图像…";
 
 /* ============================ 尺寸常量 / 样式 ============================ */
 const ROW_H = 22;              // 本包 22px 控件规范
-const STYLE_ID = "josia-bbox-edit-style";
-const HANDLE = 7;              // 缩放手柄命中半径（屏幕像素）
+const CANVAS_MIN_H = 120;      // 画布最小显示高（flex 布局下随节点伸缩，再小挤压绘框）
+const HANDLE = 8;              // 缩放手柄命中半径（画布像素）
+/* DOM 容器固定行总高（不含画布与列表，这两块自适应）：
+ * 状态22 + 胶囊22 + 文字22 + 描述22 + 颜色16 + 位置22 + 行间gap 6×6=36 + 内边距上下12 = 174 */
+const CHROME_H = 174;
+const CANVAS_BASE_H = 240;     // 画布基准高（flex-grow 拉伸的起点）
+/* 列表不设高度上限、不滚动：每增/删一个选区，列表就高/矮一行，
+ * 节点高度按差值同步向下生长/收缩，画布（预览区）高度始终不变。 */
+const LIST_EMPTY_H = 36;       // 空列表（提示行）的估高，只用于新节点初始尺寸
+/* 节点外壳：标题24 + 标准控件（宽/高/图像下拉/原生上传按钮）4×26 + 余量14 */
+const NODE_CHROME_H = 24 + 26 * 4 + 14;
+const NODE_MIN_W = 300;
+/* 节点初始高：外壳 + 容器固定行 + 画布基准 + 空列表 */
+const NODE_BASE_H = NODE_CHROME_H + CHROME_H + CANVAS_BASE_H + LIST_EMPTY_H;
 
+/* 调色板（中文名用于悬停提示） */
 const PALETTE = [
-  "#e05252", "#e08b3f", "#d9c441", "#5fbf5f", "#3fa9d9",
-  "#4f6fe0", "#a45fd9", "#d94f9e", "#8a8f98", "#c9ced6",
+  { hex: "#e05252", name: "红" },
+  { hex: "#e08b3f", name: "橙" },
+  { hex: "#d9c441", name: "黄" },
+  { hex: "#5fbf5f", name: "绿" },
+  { hex: "#3fa9d9", name: "天蓝" },
+  { hex: "#4f6fe0", name: "蓝" },
+  { hex: "#a45fd9", name: "紫" },
+  { hex: "#d94f9e", name: "粉" },
+  { hex: "#8a8f98", name: "灰" },
+  { hex: "#c9ced6", name: "浅灰" },
 ];
 
 /**
- * 本扩展只在浏览器里做事（要 document 建 DOM 面板）。
- * 被误 import 到非浏览器环境（后端测试、Node 回归脚本）时整体不挂钩子，
- * 而不是抛 ReferenceError 把整个模块连带崩掉。
+ * 本扩展只在浏览器里做事（要 document 建 DOM）。被误 import 到非浏览器环境
+ * （后端测试、Node 回归脚本）时整体不挂钩子，而不是抛错把整个模块连带崩掉。
  */
 function hasDOM() {
   return typeof document !== "undefined" && !!document.createElement;
 }
 
+const STYLE_ID = "josia-bbox-edit-style";
 const CSS = `
-.jbe-mask{position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.55);
-  display:flex;align-items:center;justify-content:center;}
-.jbe-panel{box-sizing:border-box;width:min(880px,94vw);max-height:92vh;display:flex;
-  flex-direction:column;gap:8px;padding:12px;border-radius:8px;
-  background:var(--base-background,#171718);color:var(--base-foreground,#fff);
-  border:1px solid var(--border-default,#494a50);box-shadow:0 12px 40px rgba(0,0,0,.55);
-  font-size:12px;}
-.jbe-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-weight:600;}
-.jbe-head .sub{font-weight:400;opacity:.7;font-size:11px;}
-.jbe-main{display:flex;gap:10px;min-height:0;flex:1 1 auto;}
-.jbe-stage{flex:1 1 auto;min-width:0;display:flex;align-items:center;justify-content:center;
-  background:rgba(128,128,128,.08);border:1px solid var(--border-default,#494a50);
-  border-radius:6px;overflow:hidden;padding:6px;}
-.jbe-stage canvas{display:block;touch-action:none;cursor:crosshair;border-radius:3px;}
-.jbe-side{width:212px;flex:0 0 212px;display:flex;flex-direction:column;gap:7px;min-height:0;}
-.jbe-row{display:flex;align-items:center;gap:6px;}
-.jbe-row label{flex:0 0 auto;opacity:.8;font-size:11px;}
-.jbe-row input[type=text],.jbe-row input[type=number],.jbe-row textarea,.jbe-row select{
-  flex:1 1 auto;min-width:0;box-sizing:border-box;height:${ROW_H}px;padding:0 6px;border-radius:4px;
-  border:1px solid var(--border-default,#494a50);background:rgba(128,128,128,.14);
+.jbee{box-sizing:border-box;width:100%;display:flex;flex-direction:column;gap:6px;
+  padding:6px;font-size:11px;color:var(--base-foreground,#fff);font-family:inherit;}
+.jbee-btn{border-radius:999px;cursor:pointer;white-space:nowrap;padding:0 10px;height:${ROW_H}px;
+  display:inline-flex;align-items:center;justify-content:center;gap:4px;
+  border:1px solid var(--border-default,#494a50);background:rgba(128,128,128,.12);
   color:inherit;font-size:11px;font-family:inherit;}
-.jbe-row textarea{height:auto;min-height:44px;padding:4px 6px;resize:vertical;line-height:1.35;}
-.jbe-row select{cursor:pointer;}
-.jbe-list{flex:1 1 auto;min-height:70px;max-height:26vh;overflow:auto;border-radius:6px;
+.jbee-btn:hover{background:var(--secondary-background,rgba(128,128,128,.24));}
+.jbee-btn:disabled{opacity:.4;cursor:default;}
+.jbee-info{display:flex;align-items:center;gap:5px;}
+.jbee-info .st{flex:1 1 auto;opacity:.72;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.jbee-info .jbee-btn{padding:0 8px;}
+.jbee-stage{border:1px solid var(--border-default,#494a50);border-radius:6px;
+  background:#232529;overflow:hidden;flex:1 1 auto;min-height:${CANVAS_MIN_H}px;}
+.jbee-stage canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair;}
+.jbee-tools{display:flex;align-items:center;gap:6px;}
+.jbee-capsule{display:inline-flex;border:1px solid var(--border-default,#494a50);
+  border-radius:999px;overflow:hidden;flex:0 0 auto;}
+.jbee-capsule button{border:0;background:transparent;color:inherit;height:${ROW_H}px;
+  padding:0 12px;cursor:pointer;font-size:11px;font-family:inherit;}
+.jbee-capsule button.on{background:#3d7ef0;color:#fff;}
+.jbee-capsule button:disabled{opacity:.4;cursor:default;}
+.jbee-row{display:flex;align-items:center;gap:6px;}
+.jbee-row label{flex:0 0 34px;opacity:.8;}
+.jbee-row input[type=text],.jbee-row textarea{flex:1 1 auto;min-width:0;box-sizing:border-box;
+  height:${ROW_H}px;padding:0 6px;border-radius:4px;border:1px solid var(--border-default,#494a50);
+  background:rgba(128,128,128,.14);color:inherit;font-size:11px;font-family:inherit;}
+.jbee-row input[readonly]{opacity:.7;}
+.jbee-swatches{display:flex;flex-wrap:wrap;gap:4px;flex:1 1 auto;}
+.jbee-sw{width:16px;height:16px;border-radius:4px;cursor:pointer;border:1px solid rgba(255,255,255,.25);}
+.jbee-sw.on{outline:2px solid #fff;outline-offset:1px;}
+.jbee-list{flex:0 0 auto;border-radius:6px;
   border:1px solid var(--border-default,#494a50);padding:3px;display:flex;flex-direction:column;gap:2px;}
-.jbe-item{display:flex;align-items:center;gap:6px;padding:4px 6px;border-radius:4px;cursor:pointer;
+.jbee-item{display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:4px;cursor:pointer;
   font-size:11px;}
-.jbe-item:hover{background:var(--secondary-background,#262729);}
-.jbe-item.on{background:rgba(120,170,255,.22);outline:1px solid rgba(120,170,255,.5);}
-.jbe-item .no{flex:0 0 auto;font-weight:600;opacity:.85;min-width:20px;}
-.jbe-item .tx{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.jbe-item .del{flex:0 0 auto;opacity:.55;cursor:pointer;padding:0 3px;}
-.jbe-item .del:hover{opacity:1;color:#e05252;}
-.jbe-empty{opacity:.55;font-size:11px;padding:8px 6px;text-align:center;}
-.jbe-foot{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
-.jbe-foot .sp{flex:1 1 auto;}
-.jbe-btn{border-radius:999px;cursor:pointer;white-space:nowrap;padding:0 11px;height:${ROW_H}px;
-  display:inline-flex;align-items:center;border:1px solid var(--border-default,#494a50);
-  background:rgba(128,128,128,.12);color:inherit;font-size:11px;font-family:inherit;}
-.jbe-btn:hover{background:var(--secondary-background,rgba(128,128,128,.24));}
-.jbe-btn:disabled{opacity:.4;cursor:default;}
-.jbe-btn.pri{background:#3d7ef0;border-color:#3d7ef0;color:#fff;}
-.jbe-btn.pri:hover{background:#5590f5;}
-.jbe-swatches{display:flex;flex-wrap:wrap;gap:4px;}
-.jbe-sw{width:19px;height:19px;border-radius:4px;cursor:pointer;border:1px solid rgba(255,255,255,.25);}
-.jbe-sw.on{outline:2px solid #fff;outline-offset:1px;}
-.jbe-hint{opacity:.62;font-size:11px;line-height:1.45;}
+.jbee-item:hover{background:var(--secondary-background,#262729);}
+.jbee-item.on{background:rgba(120,170,255,.22);outline:1px solid rgba(120,170,255,.5);}
+.jbee-item .no{flex:0 0 auto;font-weight:600;opacity:.85;min-width:18px;}
+.jbee-item .tx{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.jbee-item .del{flex:0 0 auto;opacity:.55;cursor:pointer;padding:0 3px;}
+.jbee-item .del:hover{opacity:1;color:#e05252;}
+.jbee-empty{opacity:.55;padding:6px;text-align:center;}
 `;
 
 function injectStyles() {
@@ -108,189 +137,199 @@ function hexToRgb(hex) {
   if (t.length === 3) return `#${t[0]}${t[0]}${t[1]}${t[1]}${t[2]}${t[2]}`;
   return `#${t.slice(0, 6).padEnd(6, "0")}`;
 }
-function rgbToHex(r, g, b) {
-  const c = (v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0");
-  return `#${c(r)}${c(g)}${c(b)}`;
+
+/* ============================ 图像来源 ============================ */
+/** 「底图」端口的上游预览图（前端给有预览的节点挂 imgs，图变了引用也会变）。 */
+function upstreamImageEl(node) {
+  const inp = (node.inputs || []).find((i) => i && i.name === PORT_BG);
+  if (!inp || inp.link == null) return null;
+  const link = app.graph?.links?.[inp.link];
+  const origin = link ? app.graph?.getNodeById?.(link.origin_id) : null;
+  const im = origin?.imgs?.[0];
+  return im && im.naturalWidth ? im : null;
 }
 
-/* ============================ 面板 ============================ */
-/**
- * @param {object}   opts
- * @param {Array}    opts.regions  已有框（0~1 分数），会被就地修改
- * @param {Function} opts.onChange 数据变化回调（每次改动都调，用于回写隐藏控件）
- * @param {Function} [opts.onBackgroundChange] 选好底图后回调
- */
-function openEditor(opts) {
-  if (!hasDOM()) return null;
+/** 「选择图像」的值 → /view 取图 URL；空选项返回 null。 */
+function uploadViewURL(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw === IMAGE_PLACEHOLDER) return null;
+  let name = raw;
+  let type = "input";
+  const m = raw.match(/^(.*?)\s*\[([^\]]+)\]$/);
+  if (m) { name = m[1].trim(); type = m[2].trim(); }
+  let subfolder = "";
+  const slash = name.lastIndexOf("/");
+  if (slash >= 0) { subfolder = name.slice(0, slash); name = name.slice(slash + 1); }
+  const q = `filename=${encodeURIComponent(name)}&subfolder=${encodeURIComponent(subfolder)}&type=${encodeURIComponent(type)}`;
+  try { return api.apiURL?.(`/view?${q}`) || `/view?${q}`; } catch (e) { return `/view?${q}`; }
+}
+
+/* ============================ 内嵌编辑器 ============================ */
+function buildEditor(node) {
+  if (node._jbeBuilt) return;
+  node._jbeBuilt = true;
   injectStyles();
 
-  const regions = Array.isArray(opts?.regions) ? opts.regions : [];
-  const onChange = typeof opts?.onChange === "function" ? opts.onChange : () => {};
-  const onBgChange = typeof opts?.onBackgroundChange === "function" ? opts.onBackgroundChange : null;
+  const regions = loadRegions(node);
+  let selected = regions.length ? 0 : -1;
+  let dragging = null;
+  let img = null;              // 背景图（上游元素或 /view 加载的 <img>）
+  let imgKind = null;          // 'upstream' | 'upload' | null
+  let fitRect = { dx: 0, dy: 0, dw: 0, dh: 0 };
+  let defaultType = "obj";     // 没选中框时胶囊开关指向的类型（新建框用它）
+  let boundTextRegion = null;  // 🔴 文本框当前绑定的选区对象：选区切换（含新建）时强制回填输入框，
 
-  let selected = -1;            // 选中框下标，-1 = 没选
-  let dragging = null;          // 拖拽会话
-  let bgImg = null;             // 底图 <img>
-  let zoom = 1;                 // 显示缩放
-  let viewW = 1024, viewH = 1024;
+  const root = el("div", "jbee");
 
-  const mask = el("div", "jbe-mask");
-  const panel = el("div", "jbe-panel");
-  mask.appendChild(panel);
-  document.body.appendChild(mask);
+  /* 上传走官方原生机制（后端 image 控件带 image_upload ⇒ 前端自动出
+   * 「选择上传的文件」按钮，与图像编码节点同款），这里不再自建按钮。 */
 
-  /* ---------------- 顶栏 ---------------- */
-  const head = el("div", "jbe-head");
-  const headL = el("div");
-  headL.appendChild(el("span", null, "🖼 框选编辑"));
-  const sub = el("div", "sub", "");
-  headL.appendChild(sub);
-  head.appendChild(headL);
-  const btnClose = el("button", "jbe-btn", "✕ 关闭");
-  head.appendChild(btnClose);
-  panel.appendChild(head);
+  /* —— 状态行 + 增删按钮 —— */
+  const info = el("div", "jbee-info");
+  const status = el("div", "st", "");
+  info.appendChild(status);
+  const btnAdd = el("button", "jbee-btn", "＋");
+  btnAdd.title = "新建框";
+  const btnDel = el("button", "jbee-btn", "🗑");
+  btnDel.title = "删除选中";
+  const btnClear = el("button", "jbee-btn", "清空");
+  btnClear.title = "清空全部";
+  info.appendChild(btnAdd);
+  info.appendChild(btnDel);
+  info.appendChild(btnClear);
+  root.appendChild(info);
 
-  /* ---------------- 主体：画布 + 右侧属性 ---------------- */
-  const main = el("div", "jbe-main");
-  const stage = el("div", "jbe-stage");
+  /* —— 画布 —— */
+  const stage = el("div", "jbee-stage");
   const canvas = el("canvas");
   stage.appendChild(canvas);
+  root.appendChild(stage);
   const ctx = canvas.getContext("2d");
-  main.appendChild(stage);
 
-  const side = el("div", "jbe-side");
+  /* —— 胶囊开关（物体|文字）+ 说明 —— */
+  const tools = el("div", "jbee-tools");
+  const capsule = el("div", "jbee-capsule");
+  const capObj = el("button", null, "物体");
+  const capText = el("button", null, "文字");
+  capsule.appendChild(capObj);
+  capsule.appendChild(capText);
+  tools.appendChild(capsule);
+  const capHint = el("div");
+  capHint.style.cssText = "flex:1 1 auto;opacity:.55;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+  tools.appendChild(capHint);
+  root.appendChild(tools);
 
-  // 类型
-  const rowType = el("div", "jbe-row");
-  rowType.appendChild(el("label", null, "类型"));
-  const selType = el("select");
-  [["obj", "物体 obj"], ["text", "文字 text"]].forEach(([v, t]) => {
-    const o = el("option", null, t);
-    o.value = v;
-    selType.appendChild(o);
-  });
-  rowType.appendChild(selType);
-  side.appendChild(rowType);
-
-  // 文字内容（仅 text 类型有意义）
-  const rowText = el("div", "jbe-row");
+  /* —— 文字 / 描述 —— */
+  const rowText = el("div", "jbee-row");
   rowText.appendChild(el("label", null, "文字"));
   const inpText = el("input");
   inpText.type = "text";
-  inpText.placeholder = "要渲染的字";
+  inpText.placeholder = "要渲染的字（text 类型）";
   rowText.appendChild(inpText);
-  side.appendChild(rowText);
+  root.appendChild(rowText);
 
-  // 描述
-  const rowDesc = el("div", "jbe-row");
+  const rowDesc = el("div", "jbee-row");
   rowDesc.appendChild(el("label", null, "描述"));
-  const inpDesc = el("textarea");
+  const inpDesc = el("input");
+  inpDesc.type = "text";
   inpDesc.placeholder = "例如 dress / logo（简短名词）";
   rowDesc.appendChild(inpDesc);
-  side.appendChild(rowDesc);
+  root.appendChild(rowDesc);
 
-  // 颜色
-  const rowColor = el("div", "jbe-row");
+  /* —— 颜色 —— */
+  const rowColor = el("div", "jbee-row");
   rowColor.appendChild(el("label", null, "颜色"));
-  const swBox = el("div", "jbe-swatches");
-  PALETTE.forEach((hex) => {
-    const s = el("div", "jbe-sw");
+  const swBox = el("div", "jbee-swatches");
+  PALETTE.forEach(({ hex, name }) => {
+    const s = el("div", "jbee-sw");
     s.style.background = hex;
-    s.title = hex;
+    s.dataset.hex = hex;
+    s.title = `${name} ${hex}`;
     s.addEventListener("click", () => {
-      if (selected < 0) return;
-      regions[selected].palette = [hex];
+      const r = current();
+      if (!r) return;
+      r.palette = [hex];
       commit();
     });
     swBox.appendChild(s);
   });
   rowColor.appendChild(swBox);
-  side.appendChild(rowColor);
+  root.appendChild(rowColor);
 
-  // 坐标（只读展示，方便对齐）
-  const rowCoord = el("div", "jbe-row");
+  /* —— 位置（只读回显）—— */
+  const rowCoord = el("div", "jbee-row");
   rowCoord.appendChild(el("label", null, "位置"));
   const inpCoord = el("input");
   inpCoord.type = "text";
   inpCoord.readOnly = true;
+  inpCoord.placeholder = "x,y 宽×高（像素）";
   rowCoord.appendChild(inpCoord);
-  side.appendChild(rowCoord);
+  root.appendChild(rowCoord);
 
-  // 框列表
-  const list = el("div", "jbe-list");
-  side.appendChild(list);
+  /* —— 框列表 —— */
+  const list = el("div", "jbee-list");
+  root.appendChild(list);
 
-  main.appendChild(side);
-  panel.appendChild(main);
-
-  /* ---------------- 底栏 ---------------- */
-  const foot = el("div", "jbe-foot");
-  const btnAdd = el("button", "jbe-btn pri", "＋ 新建框");
-  const btnDel = el("button", "jbe-btn", "🗑 删除选中");
-  const btnClear = el("button", "jbe-btn", "清空全部");
-  const btnFit = el("button", "jbe-btn", "适应窗口");
-  const btnBg = el("button", "jbe-btn", "🖼 底图");
-  const btnBgClear = el("button", "jbe-btn", "✕ 除底图");
-  btnBgClear.style.display = "none";
-  const sp = el("div", "sp");
-  const hint = el("div", "jbe-hint", "拖拽画框 · 拖角缩放 · 框内拖动移动 · 先背景后前景");
-  foot.appendChild(btnAdd);
-  foot.appendChild(btnDel);
-  foot.appendChild(btnClear);
-  foot.appendChild(btnFit);
-  foot.appendChild(btnBg);
-  foot.appendChild(btnBgClear);
-  foot.appendChild(sp);
-  foot.appendChild(hint);
-  panel.appendChild(foot);
-
-  /* ============================ 绘制 ============================ */
+  /* ============================ 基础读写 ============================ */
   function current() {
     return selected >= 0 && selected < regions.length ? regions[selected] : null;
   }
+  function panelDims() {
+    return [intOf(node, W_WIDTH, 1024), intOf(node, W_HEIGHT, 1024)];
+  }
+  function curDims() {
+    return img ? [img.naturalWidth, img.naturalHeight] : panelDims();
+  }
 
-  function layout() {
-    // 底图优先按底图尺寸，没有底图就按画布控件尺寸
-    const bw = bgImg ? bgImg.naturalWidth : viewW;
-    const bh = bgImg ? bgImg.naturalHeight : viewH;
-    const box = stage.getBoundingClientRect();
-    const availW = Math.max(80, box.width - 12);
-    const availH = Math.max(80, Math.min(box.height || 420, window.innerHeight * 0.6) - 12);
-    zoom = Math.min(availW / bw, availH / bh);
-    if (!isFinite(zoom) || zoom <= 0) zoom = 1;
-    canvas.width = Math.max(1, Math.round(bw * zoom));
-    canvas.height = Math.max(1, Math.round(bh * zoom));
-    canvas.style.width = `${canvas.width}px`;
-    canvas.style.height = `${canvas.height}px`;
+  /* ============================ 画布布局 / 绘制 ============================ */
+  function fit() {
+    canvas.width = Math.max(60, stage.clientWidth || 240);
+    canvas.height = Math.max(CANVAS_MIN_H, stage.clientHeight || CANVAS_BASE_H);
+    const [bw, bh] = curDims();
+    const m = 6;
+    const s = Math.min((canvas.width - 2 * m) / bw, (canvas.height - 2 * m) / bh);
+    fitRect.dw = Math.max(1, bw * s);
+    fitRect.dh = Math.max(1, bh * s);
+    fitRect.dx = (canvas.width - fitRect.dw) / 2;
+    fitRect.dy = (canvas.height - fitRect.dh) / 2;
   }
 
   function draw() {
     const w = canvas.width;
     const h = canvas.height;
+    const { dx, dy, dw, dh } = fitRect;
     ctx.clearRect(0, 0, w, h);
-    if (bgImg) {
-      try { ctx.drawImage(bgImg, 0, 0, w, h); } catch (e) { /* 忽略 */ }
+    ctx.fillStyle = "#232529";
+    ctx.fillRect(0, 0, w, h);
+
+    // 画布区内容裁进 fit 矩形
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(dx, dy, dw, dh);
+    ctx.clip();
+    if (img) {
+      try { ctx.drawImage(img, dx, dy, dw, dh); } catch (e) { /* 图未就绪就先画网格 */ }
       ctx.fillStyle = "rgba(0,0,0,0.55)";
-      ctx.fillRect(0, 0, w, h);
+      ctx.fillRect(dx, dy, dw, dh);
     } else {
       ctx.fillStyle = "#33363c";
-      ctx.fillRect(0, 0, w, h);
-      // 网格：每 1/8 一格，给个空间参照
+      ctx.fillRect(dx, dy, dw, dh);
       ctx.strokeStyle = "rgba(255,255,255,0.08)";
       ctx.lineWidth = 1;
       for (let i = 1; i < 8; i++) {
-        const x = Math.round((w * i) / 8) + 0.5;
-        const y = Math.round((h * i) / 8) + 0.5;
-        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+        const x = Math.round(dx + (dw * i) / 8) + 0.5;
+        const y = Math.round(dy + (dh * i) / 8) + 0.5;
+        ctx.beginPath(); ctx.moveTo(x, dy); ctx.lineTo(x, dy + dh); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(dx, y); ctx.lineTo(dx + dw, y); ctx.stroke();
       }
     }
+    ctx.restore();
 
     regions.forEach((r, i) => {
-      const x = r.x * w;
-      const y = r.y * h;
-      const bw = r.w * w;
-      const bh = r.h * h;
+      const x = dx + r.x * dw;
+      const y = dy + r.y * dh;
+      const bw = r.w * dw;
+      const bh = r.h * dh;
       const color = (r.palette && r.palette[0]) || "#8a8f98";
       const on = i === selected;
 
@@ -300,7 +339,6 @@ function openEditor(opts) {
       ctx.strokeRect(x, y, bw, bh);
       ctx.setLineDash([]);
 
-      // 序号标签
       const tag = String(i + 1).padStart(2, "0");
       ctx.font = "600 11px sans-serif";
       const tw = ctx.measureText(tag).width;
@@ -309,7 +347,6 @@ function openEditor(opts) {
       ctx.fillStyle = "#101114";
       ctx.fillText(tag, x + 4, y + 11);
 
-      // 描述文字
       let body = r.desc || "";
       if (r.type === "text" && r.text) body = `"${r.text}"${body ? " — " + body : ""}`;
       if (body && bw > 10) {
@@ -339,7 +376,6 @@ function openEditor(opts) {
         ctx.restore();
       }
 
-      // 选中时画 8 个缩放手柄
       if (on) {
         ctx.fillStyle = "#fff";
         ctx.strokeStyle = color;
@@ -362,32 +398,38 @@ function openEditor(opts) {
     ];
   }
 
+  /* 8 个手柄对应的鼠标指针：左上/右下↘、右上/左下↙、上下、左右 */
+  const HANDLE_CURSORS = [
+    "nwse-resize", "ns-resize", "nesw-resize",
+    "ew-resize", "ew-resize",
+    "nesw-resize", "ns-resize", "nwse-resize",
+  ];
+
   /* ============================ 交互 ============================ */
-  function toLocal(e) {
+  function toFrac(e) {
     const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) * (canvas.width / Math.max(1, rect.width));
+    const y = (e.clientY - rect.top) * (canvas.height / Math.max(1, rect.height));
     return {
-      x: (e.clientX - rect.left) / Math.max(1, rect.width),
-      y: (e.clientY - rect.top) / Math.max(1, rect.height),
+      x: (x - fitRect.dx) / fitRect.dw,
+      y: (y - fitRect.dy) / fitRect.dh,
     };
   }
 
   function hitHandle(pt) {
     if (selected < 0) return -1;
     const r = regions[selected];
-    const w = canvas.width;
-    const h = canvas.height;
-    // 转成像素判命中：手柄是屏幕尺寸的，缩放后不该变得难点/难抓
-    const tol = HANDLE / Math.max(1, Math.min(rectScale()));
-    const hs = handlesOf(r.x * w, r.y * h, r.w * w, r.h * h);
+    const { dx, dy, dw, dh } = fitRect;
+    // 手柄命中按「画布像素」直接比：px/py 与 hs 都是画布坐标，容差必须同单位（像素），
+    // ❌ 旧写法把像素容差除以画布尺寸换成分数再比像素 ⇒ 数值≈0.03px，永远命不中。
+    const tol = HANDLE;
+    const hs = handlesOf(dx + r.x * dw, dy + r.y * dh, r.w * dw, r.h * dh);
+    const px = dx + pt.x * dw;
+    const py = dy + pt.y * dh;
     for (let i = 0; i < hs.length; i++) {
-      if (Math.abs(pt.x * w - hs[i][0]) <= tol && Math.abs(pt.y * h - hs[i][1]) <= tol) return i;
+      if (Math.abs(px - hs[i][0]) <= tol && Math.abs(py - hs[i][1]) <= tol) return i;
     }
     return -1;
-  }
-
-  function rectScale() {
-    const rect = canvas.getBoundingClientRect();
-    return rect.width ? canvas.width / rect.width : 1;
   }
 
   function hitBox(pt) {
@@ -400,7 +442,7 @@ function openEditor(opts) {
   }
 
   canvas.addEventListener("pointerdown", (e) => {
-    const pt = toLocal(e);
+    const pt = toFrac(e);
     const hh = hitHandle(pt);
     if (hh >= 0 && selected >= 0) {
       dragging = { mode: "resize", handle: hh, start: pt, orig: { ...regions[selected] } };
@@ -410,34 +452,47 @@ function openEditor(opts) {
         selected = hit;
         dragging = { mode: "move", start: pt, orig: { ...regions[hit] } };
       } else {
-        // 空白处起手 = 画新框
-        dragging = { mode: "create", start: pt };
+        // 空白处起手 = 画新框（起点也夹回画布内：四周留白处起手不许出界）
+        const sx = Math.max(0, Math.min(1, pt.x));
+        const sy = Math.max(0, Math.min(1, pt.y));
+        dragging = { mode: "create", start: { x: sx, y: sy } };
         regions.push({
-          x: pt.x, y: pt.y, w: 0, h: 0,
-          type: "obj", text: "", desc: "", palette: [PALETTE[regions.length % PALETTE.length]],
+          x: sx, y: sy, w: 0, h: 0,
+          type: defaultType, text: "", desc: "",
+          palette: [PALETTE[regions.length % PALETTE.length].hex],
         });
         selected = regions.length - 1;
       }
     }
     canvas.setPointerCapture?.(e.pointerId);
-    syncSide();
+    syncProps();
     draw();
     e.preventDefault();
     e.stopPropagation();
   });
 
   canvas.addEventListener("pointermove", (e) => {
-    if (!dragging) return;
-    const pt = toLocal(e);
+    // 悬停反馈：手柄＝方向箭头 / 框内＝移动 / 空白＝十字。拖动中不抢。
+    if (!dragging) {
+      const pt = toFrac(e);
+      const hh = hitHandle(pt);
+      canvas.style.cursor = hh >= 0 ? HANDLE_CURSORS[hh]
+        : (hitBox(pt) >= 0 ? "move" : "crosshair");
+      return;
+    }
+    const pt = toFrac(e);
     const dx = pt.x - dragging.start.x;
     const dy = pt.y - dragging.start.y;
 
     if (dragging.mode === "create") {
+      // 画新框：指针一律夹回画布内（0~1），框永远画不出画布边界
+      const cx = Math.max(0, Math.min(1, pt.x));
+      const cy = Math.max(0, Math.min(1, pt.y));
       const r = regions[selected];
-      r.x = Math.min(dragging.start.x, pt.x);
-      r.y = Math.min(dragging.start.y, pt.y);
-      r.w = Math.abs(dx);
-      r.h = Math.abs(dy);
+      r.x = Math.max(0, Math.min(dragging.start.x, cx));
+      r.y = Math.max(0, Math.min(dragging.start.y, cy));
+      r.w = Math.abs(cx - dragging.start.x);
+      r.h = Math.abs(cy - dragging.start.y);
     } else if (dragging.mode === "move") {
       const r = regions[selected];
       r.x = Math.max(0, Math.min(1 - r.w, dragging.orig.x + dx));
@@ -459,7 +514,7 @@ function openEditor(opts) {
       r.w = Math.min(1, x2) - r.x;
       r.h = Math.min(1, y2) - r.y;
     }
-    syncSide();
+    syncProps();
     draw();
     e.preventDefault();
     e.stopPropagation();
@@ -483,56 +538,94 @@ function openEditor(opts) {
   canvas.addEventListener("pointerup", endDrag);
   canvas.addEventListener("pointercancel", endDrag);
 
-  // 滚轮调整所选框大小（不缩放视图，免得越滚越糊）
-  canvas.addEventListener("wheel", (e) => {
-    const r = current();
-    if (!r) return;
+  // 🔴 滚轮＝缩放 ComfyUI 界面（与节点外一致）。旧版在这里缩放所选框，
+  //    与「想缩放画面」的手感冲突、极易误触，已彻底移除。
+  //    DOM 区域的 wheel 事件目标不是 litegraph 主画布、不会自己触发界面缩放，
+  //    所以在容器上统一截获后，用同坐标的合成 WheelEvent 转发给主画布，
+  //    litegraph 以鼠标为中心完成缩放。
+  root.addEventListener("wheel", (e) => {
+    try {
+      const lg = app.canvas && app.canvas.canvas;
+      if (lg) {
+        lg.dispatchEvent(new WheelEvent("wheel", {
+          deltaX: e.deltaX,
+          deltaY: e.deltaY,
+          deltaZ: e.deltaZ,
+          deltaMode: e.deltaMode,
+          clientX: e.clientX,
+          clientY: e.clientY,
+          ctrlKey: e.ctrlKey,
+          shiftKey: e.shiftKey,
+          altKey: e.altKey,
+          metaKey: e.metaKey,
+          bubbles: true,
+          cancelable: true,
+        }));
+      }
+    } catch (err) { /* 主画布不可用就随他去，绝不因转发挂掉 */ }
     e.preventDefault();
     e.stopPropagation();
-    const k = e.deltaY > 0 ? 0.98 : 1.02;
-    const cx = r.x + r.w / 2;
-    const cy = r.y + r.h / 2;
-    r.w = Math.max(0.01, Math.min(1, r.w * k));
-    r.h = Math.max(0.01, Math.min(1, r.h * k));
-    r.x = Math.max(0, Math.min(1 - r.w, cx - r.w / 2));
-    r.y = Math.max(0, Math.min(1 - r.h, cy - r.h / 2));
-    commit();
   }, { passive: false, capture: true });
 
-  /* ============================ 侧栏 ============================ */
-  function syncSide() {
+  /* ============================ 属性区 / 列表 / 状态 ============================ */
+  function syncCapsule() {
+    const r = current();
+    const t = r ? r.type : defaultType;
+    capObj.classList.toggle("on", t !== "text");
+    capText.classList.toggle("on", t === "text");
+    capObj.disabled = !r;
+    capText.disabled = !r;
+    capHint.textContent = r
+      ? (r.type === "text" ? "文字框：渲染引号里的字" : "物体框：分区描述给下游")
+      : "先选框（或拖画布画一个）";
+  }
+
+  function syncProps() {
     const r = current();
     const has = !!r;
-    selType.disabled = !has;
-    inpText.disabled = !has;
-    inpDesc.disabled = !has;
-    inpText.style.opacity = has && r.type === "text" ? "1" : "0.45";
     inpText.disabled = !has || r?.type !== "text";
+    inpText.style.opacity = has && r.type === "text" ? "1" : "0.45";
+    inpDesc.disabled = !has;
 
+    // 🔴 选区切换（选中别的框 / 新建框）时必须回填输入框，即便输入框此刻仍持有焦点。
+    //    旧写法用 `document.activeElement !== inpText` 当护栏：在输入框里刚给上一个框打完字、
+    //    紧接着去画布拖出新框时，焦点仍停在输入框上 ⇒ 护栏跳过回填 ⇒ 新框文本框残留旧文本，
+    //    必须切到别的节点再切回来才会清空。改用「绑定选区对象」判定：选区对象变了就强制回填，
+    //    同一选区内的 input 事件(r 仍是同一对象)不重填，避免打字时被打断。
     if (has) {
-      selType.value = r.type;
-      if (document.activeElement !== inpText) inpText.value = r.text || "";
-      if (document.activeElement !== inpDesc) inpDesc.value = r.desc || "";
-      inpCoord.value = `${(r.x * viewW).toFixed(0)},${(r.y * viewH).toFixed(0)} ${(r.w * viewW).toFixed(0)}×${(r.h * viewH).toFixed(0)}`;
+      if (r !== boundTextRegion) {
+        inpText.value = r.text || "";
+        inpDesc.value = r.desc || "";
+        boundTextRegion = r;
+      }
+      const [bw, bh] = curDims();
+      inpCoord.value = `${Math.round(r.x * bw)},${Math.round(r.y * bh)} ${Math.round(r.w * bw)}×${Math.round(r.h * bh)}`;
       const cur = (r.palette && r.palette[0]) || "";
-      Array.from(swBox.children).forEach((s) => s.classList.toggle("on", hexToRgb(s.title) === hexToRgb(cur)));
+      Array.from(swBox.children).forEach((s) => s.classList.toggle("on", hexToRgb(s.dataset.hex) === hexToRgb(cur)));
     } else {
+      if (boundTextRegion !== null) {
+        inpText.value = "";
+        inpDesc.value = "";
+        boundTextRegion = null;
+      }
       inpCoord.value = "";
+      Array.from(swBox.children).forEach((s) => s.classList.remove("on"));
     }
     btnDel.disabled = !has;
     btnClear.disabled = regions.length === 0;
+    syncCapsule();
     syncList();
-    sub.textContent = `${regions.length} 个框 · 画布 ${viewW}×${viewH}`;
   }
 
   function syncList() {
     list.textContent = "";
     if (!regions.length) {
-      list.appendChild(el("div", "jbe-empty", "还没有框。在左侧空白处拖一下就能画。"));
+      list.appendChild(el("div", "jbee-empty", "还没有框。在画布空白处拖一下就能画。"));
+      syncNodeHeight();
       return;
     }
     regions.forEach((r, i) => {
-      const item = el("div", `jbe-item${i === selected ? " on" : ""}`);
+      const item = el("div", `jbee-item${i === selected ? " on" : ""}`);
       item.appendChild(el("span", "no", String(i + 1).padStart(2, "0")));
       const label = r.type === "text" && r.text ? `"${r.text}" ${r.desc || ""}`.trim() : (r.desc || "(无描述)");
       item.appendChild(el("span", "tx", label));
@@ -548,40 +641,95 @@ function openEditor(opts) {
       item.appendChild(del);
       item.addEventListener("click", () => {
         selected = i;
-        syncSide();
+        syncProps();
         draw();
       });
       list.appendChild(item);
     });
+    syncNodeHeight();
+  }
+
+  function syncStatus() {
+    const [bw, bh] = curDims();
+    let line = regions.length
+      ? `${regions.length} 个框 · 包围 ${bboxText(bw, bh)}`
+      : "还没有框，拖画布画一个";
+    line += ` · 画布 ${bw}×${bh}`;
+    status.textContent = line;
+  }
+
+  function bboxText(bw, bh) {
+    if (!regions.length) return "0×0";
+    let x1 = 1, y1 = 1, x2 = 0, y2 = 0;
+    for (const r of regions) {
+      x1 = Math.min(x1, r.x); y1 = Math.min(y1, r.y);
+      x2 = Math.max(x2, r.x + r.w); y2 = Math.max(y2, r.y + r.h);
+    }
+    return `${Math.max(0, Math.round((x2 - x1) * bw))}×${Math.max(0, Math.round((y2 - y1) * bh))}`;
+  }
+
+  /* 容器最小内容高：固定行(CHROME_H) + 画布基准(CANVAS_BASE_H) + 列表当前高。
+   * 列表自然生长（不设上限），getMinHeight 跟着实时走，保证节点拖不进内容以下。 */
+  function domContentH() {
+    return CHROME_H + CANVAS_BASE_H + (list.offsetHeight || 0);
+  }
+
+  /* 🔴 列表高度 ⇒ 节点高度按差值联动：新增选区节点向下生长一行、删除则缩回一行，
+   *    画布（预览区）高度始终不变 —— 改的只是节点总高，绝不重置画布。
+   *    首次调用只记录基线（工作流重载时保持已保存的节点尺寸，不跳变）。 */
+  let lastListH = 0;
+  function syncNodeHeight() {
+    const h = list.offsetHeight || 0;
+    if (!lastListH) { lastListH = h; return; }
+    const d = h - lastListH;
+    lastListH = h;
+    if (d && node.size) {
+      node.size[1] = Math.max(300, node.size[1] + d);
+      node.setDirtyCanvas?.(true, true);
+    }
   }
 
   function commit() {
-    syncSide();
+    saveRegions(node, regions);
+    fit();
+    syncProps();
+    syncStatus();
+    syncGrays(node);
     draw();
-    onChange(regions);
+    // 节点高度联动在 syncList → syncNodeHeight 里做：列表增删一行，节点按差值
+    // 向下生长/收缩一行，画布（预览区）高度始终不变 —— 绝不整体重置节点尺寸。
   }
 
-  selType.addEventListener("change", () => {
+  capObj.addEventListener("click", () => setType("obj"));
+  capText.addEventListener("click", () => setType("text"));
+  function setType(t) {
     const r = current();
-    if (!r) return;
-    r.type = selType.value === "text" ? "text" : "obj";
-    if (r.type !== "text") r.text = "";
-    commit();
-  });
+    if (r) {
+      r.type = t;
+      if (t !== "text") r.text = "";
+      commit();
+    } else {
+      defaultType = t;
+      syncCapsule();
+    }
+  }
+
   inpText.addEventListener("input", () => {
     const r = current();
     if (!r) return;
     r.text = inpText.value;
+    saveRegions(node, regions);
     syncList();
-    onChange(regions);
+    draw();
   });
   inpText.addEventListener("change", commit);
   inpDesc.addEventListener("input", () => {
     const r = current();
     if (!r) return;
     r.desc = inpDesc.value;
+    saveRegions(node, regions);
     syncList();
-    onChange(regions);
+    draw();
   });
   inpDesc.addEventListener("change", commit);
 
@@ -590,8 +738,8 @@ function openEditor(opts) {
     const s = 0.3;
     regions.push({
       x: 0.35, y: 0.35, w: s, h: s,
-      type: "obj", text: "", desc: "",
-      palette: [PALETTE[regions.length % PALETTE.length]],
+      type: defaultType, text: "", desc: "",
+      palette: [PALETTE[regions.length % PALETTE.length].hex],
     });
     selected = regions.length - 1;
     commit();
@@ -607,107 +755,148 @@ function openEditor(opts) {
     selected = -1;
     commit();
   });
-  btnFit.addEventListener("click", () => {
-    layout();
-    draw();
-  });
 
-  // 点遮罩空白处不关闭（怕误触丢数据），只能按关闭或 Esc
-  mask.addEventListener("pointerdown", (e) => {
-    if (e.target === mask) e.stopPropagation();
-  });
-  function close() {
-    try { mask.remove(); } catch (e) { /* 忽略 */ }
-    document.removeEventListener("keydown", onKey, true);
+  /* ============================ 背景刷新 / 灰化 ============================ */
+  /* 🔴 压制官方「节点体底部」原生预览：combo 带 image_upload ⇒ 前端 useImageUploadWidget
+   *    会 setNodeOutputs + showPreview，把选中的图异步塞进 node.imgs，由官方
+   *    ImagePreviewWidget 画到节点底部 —— 与内嵌画布内容重复（内嵌画布才是本节点的预览）。
+   *    配方照抄主包 media_save 已验证的做法：
+   *    ① node.isLoading = true —— 官方 useNodePreview.showPreview 的唯一读写点，
+   *       置 true 后官方装载彻底休眠（它读 store 不读 node.images，只清 imgs 拦不住）；
+   *    ② 官方预览 widget（$$canvas-image-preview 等）按官方同款移除法（onRemove + splice）
+   *       卸掉，onRemove 会释放官方挂的事件监听。
+   *    poll 每帧兜底 + 图像来源刷新时同步执行，异步回填也会被下一帧清掉。 */
+  function removePreviewWidget(name) {
+    try {
+      const idx = (node.widgets || []).findIndex((w) => w && w.name === name);
+      if (idx > -1) {
+        const w = node.widgets[idx];
+        w.onRemove?.();
+        node.widgets.splice(idx, 1);
+      }
+    } catch (e) { /* 忽略 */ }
   }
-  btnClose.addEventListener("click", close);
-  function onKey(e) {
-    if (e.key === "Escape") {
-      e.stopPropagation();
-      close();
+  function suppressNativePreview() {
+    try {
+      if (node.isLoading !== true) node.isLoading = true;
+      if (node.imgs?.length) {
+        node.imgs = [];
+        node.images = undefined;
+        node.setDirtyCanvas?.(true, true);
+      }
+    } catch (e) { /* 忽略 */ }
+    removePreviewWidget("$$canvas-image-preview");
+    removePreviewWidget("$$comfy_animation_preview");
+    removePreviewWidget("video-preview");
+  }
+
+  function refreshImage() {
+    const up = upstreamImageEl(node);
+    if (up) {
+      img = up;
+      imgKind = "upstream";
+    } else {
+      if (imgKind === "upstream") { img = null; imgKind = null; }
+      const url = uploadViewURL(getWidget(node, W_IMAGE)?.value);
+      if (url) {
+        if (imgKind !== "upload" || img?._jbeUrl !== url) {
+          const im = new Image();
+          im._jbeUrl = url;
+          im.onload = () => { if (img === im) commit(); };
+          im.onerror = () => { if (img === im) { img = null; imgKind = null; commit(); } };
+          im.src = url;
+          img = im;
+          imgKind = "upload";
+        }
+      } else {
+        img = null;
+        imgKind = null;
+      }
+    }
+    suppressNativePreview();
+    commit();
+  }
+
+  /* 每帧轻探：上游 imgs 换了引用 / 图像下拉换了值 ⇒ 实时跟着刷；
+   * 顺带压制官方节点体预览（原生 image_upload 机制每帧都可能回填，见上方说明）。 */
+  let lastUp = null;
+  let lastComboVal = undefined;
+  function poll() {
+    suppressNativePreview();
+    const up = upstreamImageEl(node);
+    const v = getWidget(node, W_IMAGE)?.value;
+    if (up !== lastUp || v !== lastComboVal) {
+      lastUp = up;
+      lastComboVal = v;
+      refreshImage();
     }
   }
-  document.addEventListener("keydown", onKey, true);
 
-  /* ============================ 底图 ============================ */
-  let bgSrc = null;   // 当前底图 data URL（重开编辑器还原用；只存内存，不写进工作流）
-  const fileInput = el("input");
-  fileInput.type = "file";
-  fileInput.accept = "image/*";
-  fileInput.style.display = "none";
-  panel.appendChild(fileInput);
+  /* ============================ 初始化 / 收尾 ============================ */
+  hideStateWidget(node);
+  const ro = new ResizeObserver(() => { fit(); draw(); });
+  ro.observe(stage);
 
-  function loadBackground(src) {
-    if (!src) { clearBackground(); return; }
-    const img = new Image();
-    img.onload = () => {
-      bgImg = img;
-      bgSrc = src;
-      // 编辑器的坐标读数和 fallback 布局也按底图尺寸走，显示才对得上
-      viewW = img.naturalWidth;
-      viewH = img.naturalHeight;
-      btnBg.textContent = "🖼 更换底图";
-      btnBgClear.style.display = "";
-      layout();
-      draw();
-      // 把画布尺寸对齐到底图尺寸：框是按 0~1 分数存的，画布尺寸对了，
-      // 输出出去的像素坐标才落在底图正确的位置上
-      if (onBgChange) onBgChange({ width: img.naturalWidth, height: img.naturalHeight, src });
+  // 面板分辨率控件变化 ⇒ 无图模式下的画布网格要跟着变
+  for (const nm of [W_WIDTH, W_HEIGHT]) {
+    const w = getWidget(node, nm);
+    if (!w) continue;
+    const prev = w.callback;
+    w.callback = function (v) {
+      const r = prev ? prev.call(this, v) : v;
+      if (!img) commit();
+      return r;
     };
-    img.onerror = () => { bgImg = null; bgSrc = null; btnBg.textContent = "🖼 底图"; btnBgClear.style.display = "none"; layout(); draw(); };
-    img.src = src;
+  }
+  // 图像下拉换值 ⇒ 立即刷新背景与灰化
+  {
+    const w = getWidget(node, W_IMAGE);
+    if (w) {
+      const prev = w.callback;
+      w.callback = function (v) {
+        const r = prev ? prev.call(this, v) : v;
+        try { refreshImage(); } catch (e) { /* 忽略 */ }
+        return r;
+      };
+    }
   }
 
-  function pickBackground() {
-    fileInput.value = "";   // 清掉上次的选择，同名文件也能再触发 change
-    fileInput.click();
-  }
+  fit();
+  syncProps();
+  syncStatus();
+  syncGrays(node);
+  poll();
 
-  function clearBackground() {
-    bgImg = null;
-    bgSrc = null;
-    btnBg.textContent = "🖼 底图";
-    btnBgClear.style.display = "none";
-    layout();
-    draw();
-    if (onBgChange) onBgChange(null);
-  }
+  node._jbeEditor = {
+    // 🔴 tick ＝ 每帧轻探（只比对引用/值，没变化零开销）；refresh ＝ 全量重刷
+    tick: poll,
+    refresh: () => { poll(); fit(); syncProps(); syncStatus(); draw(); },
+    destroy: () => { try { ro.disconnect(); } catch (e) { /* 忽略 */ } },
+    // 调试/无头回归句柄（只读 live 引用 + 最小操作，不暴露内部赋值）
+    getRegions: () => regions,
+    getSelected: () => selected,
+    removeSelected: () => { if (selected >= 0) { regions.splice(selected, 1); selected = Math.min(selected, regions.length - 1); commit(); } },
+    clear: () => { regions.length = 0; selected = -1; commit(); },
+  };
+  node.onRemoved = ((orig) => function () {
+    try { node._jbeEditor?.destroy(); } catch (e) { /* 忽略 */ }
+    return orig?.apply(this, arguments);
+  })(node.onRemoved);
 
-  fileInput.addEventListener("change", () => {
-    const file = fileInput.files && fileInput.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => loadBackground(reader.result);
-    reader.onerror = () => { /* 读失败就当没选，不弹喧嚣报错 */ };
-    reader.readAsDataURL(file);
+  // 🔴 DOM 容器高度：min ＝ 内容最小高（列表伸缩时节点不被压塌），
+  //    max ＝ 大值（节点被用户拖高后，画布区 flex 撑满、自动跟随节点尺寸自适应）。
+  const w = node.addDOMWidget("jbe_editor", "josia_bbox_edit", root, {
+    serialize: false,
+    hideOnZoom: false,
+    getMinHeight: domContentH,
+    getMaxHeight: () => 6000,
   });
+  node._jbeDom = w;
 
-  btnBg.addEventListener("click", pickBackground);
-  btnBgClear.addEventListener("click", clearBackground);
-
-  /* ============================ 初始化 ============================ */
-  viewW = opts?.width || 1024;
-  viewH = opts?.height || 1024;
-  if (opts?.background) loadBackground(opts.background);
-
-  const onResize = () => { layout(); draw(); };
-  window.addEventListener("resize", onResize);
-  const origClose = close;
-  void origClose;
-
-  layout();
-  syncSide();
-  draw();
-
-  // 选中第一个框，打开就能看到右侧属性，不至于对着空面板发呆
-  if (regions.length) selected = 0;
-  syncSide();
-  draw();
-
-  return { close, setBackground: loadBackground, refresh: () => { layout(); syncSide(); draw(); } };
+  return node._jbeEditor;
 }
 
-/* ============================ 节点集成 ============================ */
+/* ============================ 控件工具 ============================ */
 function getWidget(node, name) {
   return node.widgets ? node.widgets.find((w) => w.name === name) : null;
 }
@@ -717,33 +906,6 @@ function intOf(node, name, fallback) {
   const v = parseInt(w?.value, 10);
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
-
-function nodeSize(node) {
-  const s = node.getSize ? node.getSize() : [280, 400];
-  return { w: Math.max(240, s[0] || 280), h: 150 };
-}
-
-app.registerExtension({
-  name: "Josia.BBoxEdit",
-  async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData.name !== NODE_CLASS) return;
-    if (!hasDOM()) return;
-    const onNodeCreated = nodeType.prototype.onNodeCreated;
-    nodeType.prototype.onNodeCreated = function () {
-      const r = onNodeCreated?.apply(this, arguments);
-      setupNode(this);
-      return r;
-    };
-
-    // 1.0 里 onConfigure 在 onNodeCreated 之后跑，工作流重载要把框恢复出来
-    const onConfigure = nodeType.prototype.onConfigure;
-    nodeType.prototype.onConfigure = function () {
-      const r = onConfigure?.apply(this, arguments);
-      try { restore(this); } catch (e) { /* 忽略 */ }
-      return r;
-    };
-  },
-});
 
 function loadRegions(node) {
   const w = getWidget(node, W_STATE);
@@ -776,14 +938,6 @@ function saveRegions(node, regions) {
   node.setDirtyCanvas?.(true, true);
 }
 
-function setDims(node, width, height) {
-  const ww = getWidget(node, W_WIDTH);
-  const wh = getWidget(node, W_HEIGHT);
-  if (ww) ww.value = width;
-  if (wh) wh.value = height;
-  node.setDirtyCanvas?.(true, true);
-}
-
 /* 🔴 隐藏控件只设 hidden。ComfyUI 里 widget.hidden 同时管绘制与序列化，
  *    这里绝不能改成 options.serialize 那一套（那是 DOM 控件的开关）。 */
 function hideStateWidget(node) {
@@ -794,88 +948,81 @@ function hideStateWidget(node) {
   if (w.element) w.element.style.display = "none";
 }
 
-function restore(node) {
-  hideStateWidget(node);
-  buildButton(node);
+/** 分辨率与图像下拉的灰化：
+ *  · 「底图」端口接线 ⇒ 图像下拉灰化（端口优先）
+ *  · 有任何图像来源（接线或下拉选中）⇒ 画布宽度/高度灰化（画布按图像尺寸走） */
+function syncGrays(node) {
+  const wired = (node.inputs || []).some((i) => i && i.name === PORT_BG && i.link != null);
+  const combo = getWidget(node, W_IMAGE);
+  if (combo) combo.disabled = wired;
+  const uploaded = !!uploadViewURL(combo?.value);
+  for (const nm of [W_WIDTH, W_HEIGHT]) {
+    const w = getWidget(node, nm);
+    if (w) w.disabled = wired || uploaded;
+  }
 }
 
-function buildButton(node) {
-  if (node._jbeBuilt) return;
-  node._jbeBuilt = true;
+/** 把控件键名 image 显示成中文「选择图像」（借 widget.label 覆盖显示，不影响内部键名）。 */
+function ensureComboLabel(node) {
+  try {
+    const w = getWidget(node, W_IMAGE);
+    if (w && w.label !== "选择图像") w.label = "选择图像";
+  } catch (e) { /* 忽略 */ }
+}
 
-  const root = el("div");
-  root.style.pointerEvents = "none";
+/* ============================ 节点集成 ============================ */
+app.registerExtension({
+  name: "Josia.BBoxEdit",
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData.name !== NODE_CLASS) return;
+    if (!hasDOM()) return;
 
-  const btn = el("button", "jbe-btn pri", "🖼 打开框选编辑器");
-  btn.style.pointerEvents = "auto";
-  btn.style.width = "100%";
-  btn.style.justifyContent = "center";
-  btn.style.height = "26px";
-  btn.style.fontSize = "12px";
-  root.appendChild(btn);
-
-  const info = el("div", "jbe-hint");
-  info.style.pointerEvents = "none";
-  info.style.marginTop = "4px";
-  root.appendChild(info);
-
-  const syncInfo = () => {
-    const n = loadRegions(node).length;
-    info.textContent = n ? `当前 ${n} 个框` : "还没有框，点上面开始框选";
-  };
-
-  let panel = null;
-  btn.addEventListener("click", () => {
-    if (panel) {
-      panel.refresh();
-      return;
-    }
-    panel = openEditor({
-      regions: loadRegions(node),
-      width: intOf(node, W_WIDTH, 1024),
-      height: intOf(node, W_HEIGHT, 1024),
-      background: node._jbeBgSrc || null,
-      onChange: (regions) => {
-        saveRegions(node, regions);
-        syncInfo();
-      },
-      onBackgroundChange: (info) => {
-        if (info && info.width && info.height) {
-          // 选了底图就把画布尺寸对齐过去：框按 0~1 分数存，画布尺寸对了，
-          // 输出出去的像素坐标才落在底图正确的位置上
-          setDims(node, info.width, info.height);
-          // 记住底图，重开编辑器还在（只存节点内存，不写进工作流、不撑大 .json）
-          node._jbeBgSrc = info.src || null;
-        } else {
-          node._jbeBgSrc = null;
+    const onNodeCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      const r = onNodeCreated?.apply(this, arguments);
+      try {
+        if (this.size) this.size[0] = Math.max(this.size[0], NODE_MIN_W);
+        ensureComboLabel(this);
+        // buildEditor 内部 commit 会刷新画布/列表；节点高度按列表差值联动（syncNodeHeight），
+        // 画布高度不参与联动、不会被重置。
+        buildEditor(this);
+        // 新节点给一个合理初始高度（外壳 + 容器固定行 + 画布基准 + 空列表）；
+        // 已保存过尺寸的旧工作流节点不强行覆盖，保持用户/上次的布局。
+        if (this.size && this.size[1] < NODE_BASE_H - 60) {
+          this.size[1] = NODE_BASE_H;
         }
-        panel?.refresh();
-      },
-    });
-  });
+        this.setDirtyCanvas?.(true, true);
+      } catch (e) { /* 忽略 */ }
+      return r;
+    };
 
-  // 🔴 绝不给这个 DOM 控件设 computeSize（litegraph 会把它当成固定高度并撑大节点，
-  //    历史踩坑见主包 media_save 的注释）。只给 min/max，让它按内容取高。
-  const w = node.addDOMWidget("jbe_open", "josia_bbox_edit", root, {
-    serialize: false,
-    hideOnZoom: false,
-    getMinHeight: () => 46,
-    getMaxHeight: () => 46,
-  });
-  node._jbeDom = w;
-  syncInfo();
+    // 1.0 里 onConfigure 在 onNodeCreated 之后跑：工作流重载后要恢复框、灰化与背景
+    const onConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function () {
+      const r = onConfigure?.apply(this, arguments);
+      try {
+        hideStateWidget(this);
+        ensureComboLabel(this);
+        buildEditor(this);
+        this._jbeEditor?.refresh();
+      } catch (e) { /* 忽略 */ }
+      return r;
+    };
 
-  // 面板内选好的底图存在节点上，重开编辑器还在
-  node.onRemoved = ((orig) => function () {
-    try { panel?.close(); } catch (e) { /* 忽略 */ }
-    return orig?.apply(this, arguments);
-  })(node.onRemoved);
-}
+    // 连线 / 断线：图像下拉灰化 + 背景实时切换
+    const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+    nodeType.prototype.onConnectionsChange = function () {
+      const r = onConnectionsChange?.apply(this, arguments);
+      try { this._jbeEditor?.refresh(); } catch (e) { /* 忽略 */ }
+      return r;
+    };
 
-function setupNode(node) {
-  hideStateWidget(node);
-  buildButton(node);
-  const size = nodeSize(node);
-  node.size = [size.w, size.h];
-  node.setDirtyCanvas?.(true, true);
-}
+    // 每帧轻探：上游预览图与图像下拉值变化时实时刷新（比对引用/值，无变化零开销）
+    const onDrawBackground = nodeType.prototype.onDrawBackground;
+    nodeType.prototype.onDrawBackground = function () {
+      const r = onDrawBackground?.apply(this, arguments);
+      try { this._jbeEditor?.tick(); } catch (e) { /* 忽略 */ }
+      return r;
+    };
+  },
+});
