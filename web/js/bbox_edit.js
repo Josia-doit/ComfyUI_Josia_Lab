@@ -37,6 +37,7 @@ const IMAGE_PLACEHOLDER = "🖼️请选择或上传图像…";
 const ROW_H = 22;              // 本包 22px 控件规范
 const CANVAS_MIN_H = 120;      // 画布最小显示高（flex 布局下随节点伸缩，再小挤压绘框）
 const HANDLE = 8;              // 缩放手柄命中半径（画布像素）
+const SNAP_PX = 7;             // 吸附容差（画布显示像素）：目标线多近就吸过去
 /* DOM 容器固定行总高（不含画布与列表，这两块自适应）：
  * 状态22 + 胶囊22 + 文字22 + 描述22 + 颜色16 + 位置22 + 行间gap 6×6=36 + 内边距上下12 = 174 */
 const CHROME_H = 174;
@@ -178,6 +179,7 @@ function buildEditor(node) {
   let fitRect = { dx: 0, dy: 0, dw: 0, dh: 0 };
   let defaultType = "obj";     // 没选中框时胶囊开关指向的类型（新建框用它）
   let boundTextRegion = null;  // 🔴 文本框当前绑定的选区对象：选区切换（含新建）时强制回填输入框，
+  let snapGuides = [];         // 拖动中的吸附辅助线 [{axis:'x'|'y', pos:分数}]，按下/松手清空
 
   const root = el("div", "jbee");
 
@@ -325,6 +327,26 @@ function buildEditor(node) {
     }
     ctx.restore();
 
+    // 吸附辅助线（拖动中才出现）：压在选区下面，避免挡框
+    snapGuides.forEach((g) => {
+      ctx.save();
+      ctx.strokeStyle = "rgba(0,229,255,.85)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      if (g.axis === "x") {
+        const x = Math.round(dx + g.pos * dw) + 0.5;
+        ctx.moveTo(x, dy);
+        ctx.lineTo(x, dy + dh);
+      } else {
+        const y = Math.round(dy + g.pos * dh) + 0.5;
+        ctx.moveTo(dx, y);
+        ctx.lineTo(dx + dw, y);
+      }
+      ctx.stroke();
+      ctx.restore();
+    });
+
     regions.forEach((r, i) => {
       const x = dx + r.x * dw;
       const y = dy + r.y * dh;
@@ -398,6 +420,37 @@ function buildEditor(node) {
     ];
   }
 
+  /* ============================ 吸附 ============================ */
+  /** 某轴上的吸附目标线（分数）：画布居中 + 其他选区的两边与中线（排除拖动的那个）。 */
+  function snapTargets(axis, excludeIdx) {
+    const ts = [0.5];
+    regions.forEach((r, i) => {
+      if (i === excludeIdx) return;
+      const a = axis === "x" ? r.x : r.y;
+      const b = axis === "x" ? r.x + r.w : r.y + r.h;
+      ts.push(a, b, (a + b) / 2);
+    });
+    return ts;
+  }
+
+  /** 把一组「正在移动的边」（分数）吸附到最近的目标线；一次只吸最近的一条，防抖。
+   *  返回 {delta, guide} 或 null。edges 传该轴上移动中的边（左/右/中线）。 */
+  function snapAxis(axis, edges, excludeIdx) {
+    const span = axis === "x" ? fitRect.dw : fitRect.dh;
+    if (!span || !edges.length) return null;
+    const tol = SNAP_PX / span;
+    let best = null;
+    for (const v of edges) {
+      for (const t of snapTargets(axis, excludeIdx)) {
+        const d = t - v;
+        if (Math.abs(d) <= tol && (!best || Math.abs(d) < Math.abs(best.delta))) {
+          best = { delta: d, guide: t };
+        }
+      }
+    }
+    return best;
+  }
+
   /* 8 个手柄对应的鼠标指针：左上/右下↘、右上/左下↙、上下、左右 */
   const HANDLE_CURSORS = [
     "nwse-resize", "ns-resize", "nesw-resize",
@@ -443,11 +496,20 @@ function buildEditor(node) {
 
   canvas.addEventListener("pointerdown", (e) => {
     const pt = toFrac(e);
+    snapGuides = [];
     const hh = hitHandle(pt);
     if (hh >= 0 && selected >= 0) {
       dragging = { mode: "resize", handle: hh, start: pt, orig: { ...regions[selected] } };
     } else {
-      const hit = hitBox(pt);
+      // 🔴 已选选区优先：指针落在已选选区内 ⇒ 只允许拖动它自己。
+      //    重叠区按 z 序（后建在上）会抢走正在拖的选区——框1 压着框2 时
+      //    在重叠处起手会莫名选中框2。这里让已选的赢，想选别的先去列表点。
+      let hit = -1;
+      if (selected >= 0) {
+        const s = regions[selected];
+        if (pt.x >= s.x && pt.x <= s.x + s.w && pt.y >= s.y && pt.y <= s.y + s.h) hit = selected;
+      }
+      if (hit < 0) hit = hitBox(pt);
       if (hit >= 0) {
         selected = hit;
         dragging = { mode: "move", start: pt, orig: { ...regions[hit] } };
@@ -485,9 +547,14 @@ function buildEditor(node) {
     const dy = pt.y - dragging.start.y;
 
     if (dragging.mode === "create") {
-      // 画新框：指针一律夹回画布内（0~1），框永远画不出画布边界
-      const cx = Math.max(0, Math.min(1, pt.x));
-      const cy = Math.max(0, Math.min(1, pt.y));
+      // 画新框：指针一律夹回画布内（0~1），框永远画不出画布边界；拖动角吸合
+      let cx = Math.max(0, Math.min(1, pt.x));
+      let cy = Math.max(0, Math.min(1, pt.y));
+      snapGuides = [];
+      const scx = snapAxis("x", [cx], selected);
+      if (scx) { cx = Math.max(0, Math.min(1, cx + scx.delta)); snapGuides.push({ axis: "x", pos: scx.guide }); }
+      const scy = snapAxis("y", [cy], selected);
+      if (scy) { cy = Math.max(0, Math.min(1, cy + scy.delta)); snapGuides.push({ axis: "y", pos: scy.guide }); }
       const r = regions[selected];
       r.x = Math.max(0, Math.min(dragging.start.x, cx));
       r.y = Math.max(0, Math.min(dragging.start.y, cy));
@@ -495,8 +562,16 @@ function buildEditor(node) {
       r.h = Math.abs(cy - dragging.start.y);
     } else if (dragging.mode === "move") {
       const r = regions[selected];
-      r.x = Math.max(0, Math.min(1 - r.w, dragging.orig.x + dx));
-      r.y = Math.max(0, Math.min(1 - r.h, dragging.orig.y + dy));
+      let nx = Math.max(0, Math.min(1 - r.w, dragging.orig.x + dx));
+      let ny = Math.max(0, Math.min(1 - r.h, dragging.orig.y + dy));
+      // 移动吸附：左/右/中线 → 画布居中 + 其他选区的边与中线（含紧贴对齐）
+      snapGuides = [];
+      const sx = snapAxis("x", [nx, nx + r.w, nx + r.w / 2], selected);
+      if (sx) { nx += sx.delta; snapGuides.push({ axis: "x", pos: sx.guide }); }
+      const sy = snapAxis("y", [ny, ny + r.h, ny + r.h / 2], selected);
+      if (sy) { ny += sy.delta; snapGuides.push({ axis: "y", pos: sy.guide }); }
+      r.x = Math.max(0, Math.min(1 - r.w, nx));
+      r.y = Math.max(0, Math.min(1 - r.h, ny));
     } else if (dragging.mode === "resize") {
       const o = dragging.orig;
       const r = regions[selected];
@@ -509,6 +584,21 @@ function buildEditor(node) {
       if (H === 2 || H === 4 || H === 7) x2 = Math.max(x1 + 0.005, o.x + o.w + dx);
       if (H === 0 || H === 1 || H === 2) y1 = Math.min(y2 - 0.005, o.y + dy);
       if (H === 5 || H === 6 || H === 7) y2 = Math.max(y1 + 0.005, o.y + o.h + dy);
+      // 缩放吸附：只吸正在拖动的那条边（角手柄各拖一横一竖两条）
+      snapGuides = [];
+      const sx = snapAxis("x", (H === 0 || H === 3 || H === 5) ? [x1] : [x2], selected);
+      if (sx) {
+        if (H === 0 || H === 3 || H === 5) x1 += sx.delta; else x2 += sx.delta;
+        snapGuides.push({ axis: "x", pos: sx.guide });
+      }
+      const sy = snapAxis("y", (H === 0 || H === 1 || H === 2) ? [y1] : [y2], selected);
+      if (sy) {
+        if (H === 0 || H === 1 || H === 2) y1 += sy.delta; else y2 += sy.delta;
+        snapGuides.push({ axis: "y", pos: sy.guide });
+      }
+      // 吸附后的最小尺寸护栏：防止吸合把框压成零宽/零高（负数宽高会毁掉下游坐标）
+      if (x2 < x1 + 0.005) x2 = x1 + 0.005;
+      if (y2 < y1 + 0.005) y2 = y1 + 0.005;
       r.x = Math.max(0, x1);
       r.y = Math.max(0, y1);
       r.w = Math.min(1, x2) - r.x;
@@ -531,6 +621,7 @@ function buildEditor(node) {
       }
     }
     dragging = null;
+    snapGuides = [];
     try { canvas.releasePointerCapture?.(e.pointerId); } catch (err) { /* 忽略 */ }
     commit();
     e?.preventDefault?.();
@@ -871,6 +962,18 @@ function buildEditor(node) {
     // 🔴 tick ＝ 每帧轻探（只比对引用/值，没变化零开销）；refresh ＝ 全量重刷
     tick: poll,
     refresh: () => { poll(); fit(); syncProps(); syncStatus(); draw(); },
+    // 🔴 reload ＝ 从隐藏控件重新读框数据并整体替换 regions。
+    //    buildEditor 里的 loadRegions 只发生在节点**建成那一刻**——那时 configure
+    //    还没回填控件值，读到的是默认 "[]"。撤销 / 刷新 / loadGraphData 后控件值
+    //    才回来，必须靠这个句柄把数据补进编辑器，否则选区与描述全丢。
+    reload: (info) => {
+      const fresh = loadRegions(node, info);
+      regions.length = 0;
+      for (const r of fresh) regions.push(r);
+      selected = regions.length ? 0 : -1;
+      boundTextRegion = null;   // 选区对象换了，强制输入框按新内容回填
+      commit();
+    },
     destroy: () => { try { ro.disconnect(); } catch (e) { /* 忽略 */ } },
     // 调试/无头回归句柄（只读 live 引用 + 最小操作，不暴露内部赋值）
     getRegions: () => regions,
@@ -907,11 +1010,26 @@ function intOf(node, name, fallback) {
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
-function loadRegions(node) {
-  const w = getWidget(node, W_STATE);
-  if (!w) return [];
+/** 框数据三层取数：
+ *  ① info.widgets_values_named —— configure 传入的原始序列化值。🔴 最关键：
+ *     「框数据」是 customtext（Vue 组件控件），litegraph 回填写进 widget.value 后，
+ *     Vue 组件挂载会用节点定义默认值 "[]" 覆盖（number/combo 传统控件没这个问题）。
+ *     控件值因此在还原后不可信，必须优先读序列化原文。
+ *  ② node.properties._jbeState —— 双写兜底（新工作流一定有；老工作流回落到①）。
+ *  ③ 控件值 —— 前两者都没有时的最后回落。
+ */
+function loadRegions(node, info) {
+  let raw;
   try {
-    const data = JSON.parse(w.value || "[]");
+    raw = info && info.widgets_values_named && info.widgets_values_named[W_STATE];
+  } catch (e) { /* 忽略 */ }
+  if (!raw) raw = node.properties && node.properties._jbeState;
+  if (!raw) {
+    const w = getWidget(node, W_STATE);
+    raw = w ? w.value : "";
+  }
+  try {
+    const data = JSON.parse(raw || "[]");
     return Array.isArray(data) ? data : [];
   } catch (e) {
     return [];
@@ -933,6 +1051,9 @@ function saveRegions(node, regions) {
     palette: Array.isArray(r.palette) ? r.palette.slice(0, 5) : [],
   }));
   w.value = JSON.stringify(clean);
+  // 🔴 properties 双写：widgets_values 在部分还原路径（真实 tab 切换 / 撤销栈快照）
+  //    存在回填滞后或位置错位风险，node.properties 必随图序列化，是 reload 的兜底数据源
+  try { node.properties._jbeState = w.value; } catch (e) { /* 忽略 */ }
   // 隐藏控件照样要通知后端图变了
   try { w.callback?.(w.value, app.canvas, node, undefined, 0, 0); } catch (e) { /* 忽略 */ }
   node.setDirtyCanvas?.(true, true);
@@ -1000,11 +1121,24 @@ app.registerExtension({
     const onConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function () {
       const r = onConfigure?.apply(this, arguments);
+      // 🔴 arguments[0] ＝ configure 传入的原始序列化数据（含 widgets_values_named）。
+      //    「框数据」控件值会被 Vue 组件挂载用默认 "[]" 覆盖，读序列化原文才可靠。
+      const info = arguments[0];
       try {
         hideStateWidget(this);
         ensureComboLabel(this);
         buildEditor(this);
         this._jbeEditor?.refresh();
+        this._jbeEditor?.reload(info);
+        // 🔴 rAF 兜底：真实 tab 切换 / 撤销栈还原时，控件值回填可能晚于 onConfigure
+        //    （主包 media_save/load_latent 同款时序坑，同步读会踩空），延迟一帧再读
+        //    一次；reload 幂等，重复执行无副作用。
+        requestAnimationFrame(() => {
+          try {
+            this._jbeEditor?.refresh();
+            this._jbeEditor?.reload();
+          } catch (e) { /* 忽略 */ }
+        });
       } catch (e) { /* 忽略 */ }
       return r;
     };

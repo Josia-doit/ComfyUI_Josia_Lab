@@ -38,8 +38,6 @@ NODE_CLASS = "JosiaBBoxEdit"
 NODE_DISPLAY_NAME = "Josia框选编辑"
 NODE_CATEGORY = "⚡️Josia实验区/框选编辑"
 
-# 预览图最长边，跟官方一致：画布再大，预览也不会把节点撑爆
-PREVIEW_LONG_EDGE = 1024
 # 底图压暗倍数，跟官方一致（官方 _PREVIEW_DIM）
 PREVIEW_DIM = 0.25
 
@@ -333,19 +331,20 @@ def _bg_from_image(image):
 
 
 def render_preview(regions: list, width: int, height: int, bg=None):
-    """把框画成一张图。没有底图就画灰底，方便看清框位。"""
+    """把框画成一张图。没有底图就画灰底，方便看清框位。
+
+    🔴 **始终按原始分辨率出图**：有底图＝底图尺寸，无底图＝面板分辨率。
+    早期为「节点体预览不撑爆节点」压过预览长边（≤1024），但节点体底部预览
+    （ui.images）早已移除，预览图端口的消费者是下游图像链路（获取图像信息 /
+    布局提示词等）——压过分辩率会让像素坐标与实际画布对不上，故不再缩放。
+    """
     if bg is not None:
-        iw, ih = bg.size
-        long_edge = max(iw, ih) or 1
-        scale = min(1.0, PREVIEW_LONG_EDGE / long_edge)
-        rw, rh = max(1, round(iw * scale)), max(1, round(ih * scale))
-        base = bg.convert("RGB").resize((rw, rh), Image.LANCZOS)
+        rw, rh = bg.size
+        base = bg.convert("RGB")
         base = ImageEnhance.Brightness(base).enhance(PREVIEW_DIM)
         img = base.convert("RGBA")
     else:
-        long_edge = max(width, height) or 1
-        scale = min(1.0, PREVIEW_LONG_EDGE / long_edge)
-        rw, rh = max(1, round(width * scale)), max(1, round(height * scale))
+        rw, rh = max(1, int(width)), max(1, int(height))
         grey = round(PREVIEW_DIM * 128)
         img = Image.new("RGBA", (rw, rh), (grey, grey, grey, 255))
 
