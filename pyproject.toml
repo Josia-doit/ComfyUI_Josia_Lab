@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-josialab"
-version = "0.1.4"
+version = "0.1.5"
 description = "JosiaNodes 实验包：与主节点包分离的独立试验田，节点可随意增删。含 Qwen-Image 2.1 加速 LoRA 适配器（JosiaQwenAccel，Fun PDD / Viggle Turbo 两条路线）与 Josia框选编辑节点（图像上画框标注、导出官方格式 JSON）。"
 authors = [{ name = "Josia-doit" }]
 license = { file = "LICENSE" }

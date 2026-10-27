@@ -6,19 +6,23 @@
  * 这里用「节点内嵌 DOM + 原生 canvas」自己实现，经典模式下完全可控。
  *
  * 节点布局（自上而下）：
- *   画布宽度 / 画布高度 / 选择图像（combo）  ← 标准控件
+ *   整体描述（多行提示词） / 画布宽度 / 画布高度 / 选择图像（combo）  ← 标准控件
  *   内嵌编辑器（一个 DOM widget）：
- *     [⬆ 上传图像] → [状态行 + ＋/🗑/清空] → 画布（有图＝变暗的图，无图＝网格）
+ *     [状态行 + ＋/🗑/清空] → 画布（有图＝变暗的图，无图＝网格）
  *     → 胶囊开关（物体|文字）→ 文字 / 描述 / 颜色 / 位置 → 框列表
  *
  * 图像来源（二选一，端口优先）：
- *   · 「选择图像」下拉（内部键名 image）：input 目录图像文件；「⬆ 上传图像」上传后进本下拉
+ *   · 「选择图像」下拉（内部键名 image）：input 目录图像文件；原生上传按钮传图后进本下拉
  *   · 「底图」输入端口：实时显示上游节点的预览图（上游 imgs 一变就跟着刷）
  * 有图像 ⇒ 画布/坐标按图像尺寸走，画布宽度/高度灰化；无图像 ⇒ 按面板分辨率画网格画布。
  *
  * 数据流：编辑框 → 序列化成 JSON → 写进隐藏的「框数据」控件 → 后端解析。
  * 落盘的 JSON 与官方编辑器状态同构：[{x,y,w,h,type,text,desc,palette}]，坐标是 0~1 分数。
  * 框的顺序即层级：官方注释写明「背景元素先放、前景最后放」，这里沿用同一约定。
+ *
+ * 「边界框」输入端口（BOUNDING_BOXES）：接上游的框；编辑器为空时，后端在执行时
+ * 按画布尺寸把像素框归一化后灌进来，经 onExecuted 的 ui.boxes 落进编辑器显示
+ * （前端落盘后下次执行即视为手画的框，不再重复灌）。编辑器已有框时端口不生效。
  */
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
@@ -29,6 +33,7 @@ const NODE_CLASS = "JosiaBBoxEdit";
 const W_WIDTH = "画布宽度";
 const W_HEIGHT = "画布高度";
 const W_STATE = "框数据";
+const W_PROMPT = "整体描述";
 const W_IMAGE = "image";
 const PORT_BG = "底图";
 const IMAGE_PLACEHOLDER = "🖼️请选择或上传图像…";
@@ -38,6 +43,7 @@ const ROW_H = 22;              // 本包 22px 控件规范
 const CANVAS_MIN_H = 120;      // 画布最小显示高（flex 布局下随节点伸缩，再小挤压绘框）
 const HANDLE = 8;              // 缩放手柄命中半径（画布像素）
 const SNAP_PX = 7;             // 吸附容差（画布显示像素）：目标线多近就吸过去
+const EDGE_TOL = 6;            // 边线穿透选中容差（画布像素）：点距某选区边线 ≤ 此值即算「点中边线」
 /* DOM 容器固定行总高（不含画布与列表，这两块自适应）：
  * 状态22 + 胶囊22 + 文字22 + 描述22 + 颜色16 + 位置22 + 行间gap 6×6=36 + 内边距上下12 = 174 */
 const CHROME_H = 174;
@@ -45,8 +51,19 @@ const CANVAS_BASE_H = 240;     // 画布基准高（flex-grow 拉伸的起点）
 /* 列表不设高度上限、不滚动：每增/删一个选区，列表就高/矮一行，
  * 节点高度按差值同步向下生长/收缩，画布（预览区）高度始终不变。 */
 const LIST_EMPTY_H = 36;       // 空列表（提示行）的估高，只用于新节点初始尺寸
-/* 节点外壳：标题24 + 标准控件（宽/高/图像下拉/原生上传按钮）4×26 + 余量14 */
-const NODE_CHROME_H = 24 + 26 * 4 + 14;
+/* 「画面描述」文本框固定为小尺寸且**不随节点缩放撑大**：
+ * 该 multiline 控件是「可增长控件」，靠 h-full 填满被分配到的槽位。直接写死 height 会
+ * 锁死（放大留白、缩小溢出）；只压 min-height 仍会随节点放大撑大。正确做法是用
+ * computeLayoutSize 返回固定 min==max，自由空间分配时它分到的额外空间为 0，节点放大
+ * 多出的高度全部给下方编辑器（画布+列表）。PROMPT_TA_H＝文本框像素高（约 3 行），
+ * PROMPT_SLOT_H＝控件槽位总高（含标签行）。 */
+const PROMPT_TA_H = 56;
+const PROMPT_SLOT_H = 80;
+/* 节点外壳高（编辑器 DOM widget 之上的全部内容）：标题 + 输出端口区 + 标准控件
+ * （画面描述多行固定 PROMPT_SLOT_H＝80；画布宽度/画布高度/图像下拉/原生上传按钮 各24）
+ * + 余量。无头实测编辑器起点 y≈262（端口数/高度变化时需重新实测）。NODE_CHROME_H 仅用于
+ * 新节点初始高，运行时编辑器按真实 DOM 控件 y 定位。 */
+const NODE_CHROME_H = 262;
 const NODE_MIN_W = 300;
 /* 节点初始高：外壳 + 容器固定行 + 画布基准 + 空列表 */
 const NODE_BASE_H = NODE_CHROME_H + CHROME_H + CANVAS_BASE_H + LIST_EMPTY_H;
@@ -88,6 +105,9 @@ const CSS = `
 .jbee-info .jbee-btn{padding:0 8px;}
 .jbee-stage{border:1px solid var(--border-default,#494a50);border-radius:6px;
   background:#232529;overflow:hidden;flex:1 1 auto;min-height:${CANVAS_MIN_H}px;}
+/* 「画面描述」文本框固定小尺寸：高度写死 + 不可手动拉伸，长文本内部滚动，不撑大节点。 */
+.jbee-prompt textarea{height:${PROMPT_TA_H}px !important;min-height:${PROMPT_TA_H}px !important;
+  max-height:${PROMPT_TA_H}px !important;resize:none !important;overflow:auto !important;}
 .jbee-stage canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair;}
 .jbee-tools{display:flex;align-items:center;gap:6px;}
 .jbee-capsule{display:inline-flex;border:1px solid var(--border-default,#494a50);
@@ -107,7 +127,7 @@ const CSS = `
 .jbee-sw.on{outline:2px solid #fff;outline-offset:1px;}
 .jbee-list{flex:0 0 auto;border-radius:6px;
   border:1px solid var(--border-default,#494a50);padding:3px;display:flex;flex-direction:column;gap:2px;}
-.jbee-item{display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:4px;cursor:pointer;
+.jbee-item{display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:4px;cursor:pointer;user-select:none;
   font-size:11px;}
 .jbee-item:hover{background:var(--secondary-background,#262729);}
 .jbee-item.on{background:rgba(120,170,255,.22);outline:1px solid rgba(120,170,255,.5);}
@@ -116,6 +136,14 @@ const CSS = `
 .jbee-item .del{flex:0 0 auto;opacity:.55;cursor:pointer;padding:0 3px;}
 .jbee-item .del:hover{opacity:1;color:#e05252;}
 .jbee-empty{opacity:.55;padding:6px;text-align:center;}
+.jbee-grip{flex:0 0 auto;cursor:grab;opacity:.45;user-select:none;touch-action:none;
+  padding:0 3px;font-size:12px;line-height:1;}
+.jbee-grip:hover{opacity:.9;}
+.jbee-grip:active{cursor:grabbing;}
+.jbee-item.dragging{opacity:.4;}
+.jbee-item.drop-before{box-shadow:inset 0 2px 0 0 #6fb0ff;}
+.jbee-item.drop-after{box-shadow:inset 0 -2px 0 0 #6fb0ff;}
+.jbee-hint{opacity:.5;font-size:10px;padding:2px 4px 0;line-height:1.4;}
 `;
 
 function injectStyles() {
@@ -174,6 +202,8 @@ function buildEditor(node) {
   const regions = loadRegions(node);
   let selected = regions.length ? 0 : -1;
   let dragging = null;
+  let hoverTarget = -1;        // 悬停时「点下去会选中的那一层」（≠ 顶层时高亮，给边线穿透/Alt 循环做预览）
+  let gripDragging = null;     // 列表拖拽排序状态（含「点按 vs 拖动」区分）
   let img = null;              // 背景图（上游元素或 /view 加载的 <img>）
   let imgKind = null;          // 'upstream' | 'upload' | null
   let fitRect = { dx: 0, dy: 0, dw: 0, dh: 0 };
@@ -271,16 +301,54 @@ function buildEditor(node) {
   /* —— 框列表 —— */
   const list = el("div", "jbee-list");
   root.appendChild(list);
+  const listHint = el("div", "jbee-hint", "拖动列表项调整层级顺序 · Alt+点击画布选中被遮挡的下一层");
+  root.appendChild(listHint);
 
   /* ============================ 基础读写 ============================ */
   function current() {
     return selected >= 0 && selected < regions.length ? regions[selected] : null;
   }
+  // 输入端口是否已连上游（连线后 node.inputs 对应槽位的 link 不为空）
+  function inputLinked(name) {
+    const inp = node.inputs && node.inputs.find((i) => i.name === name);
+    return !!(inp && inp.link != null);
+  }
   function panelDims() {
     return [intOf(node, W_WIDTH, 1024), intOf(node, W_HEIGHT, 1024)];
   }
+  /** 「底图」端口上游节点广播的**实际输出**尺寸 [w,h]（取不到返回 null）。
+   *  会缩放的节点（如图像编码）把算好的输出尺寸挂在 _jencOutSize 上。
+   *  🔴 单向 duck-typed 读取：上游不广播就自动降级，Lab 包不依赖主包存在。 */
+  function upstreamOutDims() {
+    const inp = (node.inputs || []).find((i) => i && i.name === PORT_BG);
+    if (!inp || inp.link == null) return null;
+    const link = app.graph?.links?.[inp.link];
+    const origin = link ? app.graph?.getNodeById?.(link.origin_id) : null;
+    const d = origin && origin._jencOutSize;
+    if (!Array.isArray(d) || d.length !== 2) return null;
+    const w = +d[0];
+    const h = +d[1];
+    if (!(w > 0) || !(h > 0)) return null;
+    return [w, h];
+  }
   function curDims() {
-    return img ? [img.naturalWidth, img.naturalHeight] : panelDims();
+    // 🔴 坐标基准必须等于**下游真正收到的那张图**的尺寸，否则框坐标整体错位。
+    //    视觉上无差别（图都是 fit 缩放进画布矩形），错的只是坐标基准——最隐蔽的那种。
+    // ① 「底图」端口接了上游 ⇒ 上游可能先缩放再输出，预览图只是源图、不可信：
+    //    上游广播的实际输出尺寸（实时）> 后端回传权威尺寸（执行后）> 预览图原始尺寸。
+    if (inputLinked(PORT_BG)) {
+      const up = upstreamOutDims();
+      if (up) return up;
+      if (node._jbeDims) return node._jbeDims;
+      if (img) return [img.naturalWidth, img.naturalHeight];
+      return panelDims();
+    }
+    // ② 「选择图像」上传的图：预览即原文件，naturalWidth 就是实际尺寸
+    if (img) return [img.naturalWidth, img.naturalHeight];
+    // ③ 分辨率选择器接了上游：执行后优先用后端回传的权威尺寸（未执行前回落面板值）
+    if (inputLinked(W_WIDTH) && node._jbeDims) return node._jbeDims;
+    // ④ 无图像 ⇒ 面板分辨率（直接读控件，手改实时生效）
+    return panelDims();
   }
 
   /* ============================ 画布布局 / 绘制 ============================ */
@@ -376,25 +444,25 @@ function buildEditor(node) {
         ctx.beginPath();
         ctx.rect(x, y, bw, bh);
         ctx.clip();
-        ctx.font = "11px sans-serif";
+        // 自动换行（兼容中英文：空格分词 + 超宽无空格串逐字断行）；
+        // 仍超出框高时随框高微调字号，确保文字不被隐藏。
         ctx.fillStyle = "rgba(255,255,255,0.95)";
         ctx.shadowColor = "rgba(0,0,0,0.85)";
         ctx.shadowBlur = 3;
-        const words = String(body).split(/(\s+)/);
-        let line = "";
-        let ty = y + 26;
-        for (const word of words) {
-          const test = line + word;
-          if (ctx.measureText(test).width > bw - 8 && line) {
-            ctx.fillText(line, x + 4, ty);
-            ty += 14;
-            line = word;
-            if (ty > y + bh) break;
-          } else {
-            line = test;
-          }
+        let fs = 11, lh = 14;
+        let lines;
+        for (;;) {
+          ctx.font = fs + "px sans-serif";
+          lines = wrapText(ctx, body, bw - 8);
+          if (26 + lines.length * lh <= bh + 3 || fs <= 7) break;
+          fs -= 1; lh = fs + 3;
         }
-        if (line && ty <= y + bh) ctx.fillText(line, x + 4, ty);
+        let ty = y + 26;
+        for (const ln of lines) {
+          if (ty - fs > y + bh) break;   // 文字顶部已越过框底 ⇒ 停止
+          ctx.fillText(ln, x + 4, ty);
+          ty += lh;
+        }
         ctx.restore();
       }
 
@@ -410,6 +478,18 @@ function buildEditor(node) {
         });
       }
     });
+
+    // 悬停穿透预览：高亮「若点下去会选中的那一层」（非顶层时），提示边线穿透/Alt 循环目标
+    if (hoverTarget >= 0 && hoverTarget !== selected && regions[hoverTarget]) {
+      const r = regions[hoverTarget];
+      const x = dx + r.x * dw, y = dy + r.y * dh, bw = r.w * dw, bh = r.h * dh;
+      ctx.save();
+      ctx.strokeStyle = "rgba(120,200,255,.9)";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 3]);
+      ctx.strokeRect(x - 1.5, y - 1.5, bw + 3, bh + 3);
+      ctx.restore();
+    }
   }
 
   function handlesOf(x, y, w, h) {
@@ -418,6 +498,35 @@ function buildEditor(node) {
       [x, y + h / 2], [x + w, y + h / 2],
       [x, y + h], [x + w / 2, y + h], [x + w, y + h],
     ];
+  }
+
+  /** 按 maxWidth 断行：空格分词（英文），超宽无空格串（如中文）逐字断行；保留显式换行。 */
+  function wrapText(ctx, text, maxWidth) {
+    const out = [];
+    const paras = String(text).split("\n");
+    for (const para of paras) {
+      const tokens = para.split(/(\s+)/);
+      let line = "";
+      for (const tok of tokens) {
+        if (tok === "") continue;
+        if (ctx.measureText(tok).width > maxWidth) {
+          if (line) { out.push(line.trim()); line = ""; }
+          let chunk = "";
+          for (const ch of tok) {
+            const t = chunk + ch;
+            if (ctx.measureText(t).width > maxWidth && chunk) { out.push(chunk); chunk = ch; }
+            else chunk = t;
+          }
+          if (chunk) line = chunk;
+        } else {
+          const t = line + tok;
+          if (ctx.measureText(t).width > maxWidth && line) { out.push(line.trim()); line = tok; }
+          else line = t;
+        }
+      }
+      if (line) out.push(line.trim());
+    }
+    return out;
   }
 
   /* ============================ 吸附 ============================ */
@@ -494,25 +603,74 @@ function buildEditor(node) {
     return -1;
   }
 
+  /* —— 边线穿透 / Alt 循环选中 —— */
+  /** 点 pt 处的 z 栈（从顶到底的 regions 索引）。 */
+  function stackAt(pt) {
+    const stack = [];
+    for (let i = regions.length - 1; i >= 0; i--) {
+      const r = regions[i];
+      if (pt.x >= r.x && pt.x <= r.x + r.w && pt.y >= r.y && pt.y <= r.y + r.h) stack.push(i);
+    }
+    return stack;
+  }
+  /** pt 距 regions[i] 边线的画布像素距离（pt 需在框内；越小越贴边）。 */
+  function edgeGapPx(i, pt) {
+    const r = regions[i];
+    const x = fitRect.dx + r.x * fitRect.dw, y = fitRect.dy + r.y * fitRect.dh;
+    const w = r.w * fitRect.dw, h = r.h * fitRect.dh;
+    const px = fitRect.dx + pt.x * fitRect.dw, py = fitRect.dy + pt.y * fitRect.dh;
+    return Math.min(px - x, (x + w) - px, py - y, (y + h) - py);
+  }
+  /** 栈内「最靠上的、边线在容差内的」位置 p（0=顶）；无则 -1。 */
+  function topmostEdgePos(stack, tol) {
+    for (let p = 0; p < stack.length; p++) {
+      if (edgeGapPx(stack[p], pt) <= tol) return p;
+    }
+    return -1;
+  }
+  /** 点击 pt 应选哪个选区（稳健版：已恢复「已选优先 → 顶层命中」的可用逻辑）。
+   *   alt=true  ⇒ z 栈里循环到「当前选中的下一层」（含被完全遮挡的底层盲区）；
+   *   alt=false ⇒ 先「已选优先」（点已选框内部直接移动它，不被上层局部盖走），
+   *              再顶层命中；若点的恰是「非当前选中」层的边线且下方还藏有其它层 ⇒ 穿透到下方那层。
+   *   任意异常都不应让点击变成「画新框」或「无反应」——调用方对返回 -1 才走新建分支，
+   *   所以本函数对非空栈一律兜底返回顶层，绝不误返回 -1。 */
+  function pickRegion(pt, alt) {
+    const stack = stackAt(pt);
+    if (!stack.length) return -1;            // 空白处 ⇒ 画新框
+    if (alt) {                              // Alt+点击：循环到下一层（穿透遮挡盲区）
+      const p = stack.indexOf(selected);
+      return (p >= 0 && p < stack.length - 1) ? stack[p + 1] : stack[0];
+    }
+    // 已知可用逻辑：已选优先 → 顶层命中（后画的在上）
+    let hit = -1;
+    if (selected >= 0) {
+      const s = regions[selected];
+      if (s && pt.x >= s.x && pt.x <= s.x + s.w && pt.y >= s.y && pt.y <= s.y + s.h) hit = selected;
+    }
+    if (hit < 0) hit = hitBox(pt);
+    // 边线穿透：点中「非当前选中」层的边线且下方还藏有其它层 ⇒ 选中下方那层
+    if (hit >= 0 && hit !== selected) {
+      const p = topmostEdgePos(stack, EDGE_TOL);
+      if (p >= 0 && stack[p] === hit && p + 1 < stack.length) hit = stack[p + 1];
+    }
+    return hit;
+  }
+
   canvas.addEventListener("pointerdown", (e) => {
     const pt = toFrac(e);
     snapGuides = [];
+    hoverTarget = -1;
     const hh = hitHandle(pt);
     if (hh >= 0 && selected >= 0) {
       dragging = { mode: "resize", handle: hh, start: pt, orig: { ...regions[selected] } };
     } else {
-      // 🔴 已选选区优先：指针落在已选选区内 ⇒ 只允许拖动它自己。
-      //    重叠区按 z 序（后建在上）会抢走正在拖的选区——框1 压着框2 时
-      //    在重叠处起手会莫名选中框2。这里让已选的赢，想选别的先去列表点。
-      let hit = -1;
-      if (selected >= 0) {
-        const s = regions[selected];
-        if (pt.x >= s.x && pt.x <= s.x + s.w && pt.y >= s.y && pt.y <= s.y + s.h) hit = selected;
-      }
-      if (hit < 0) hit = hitBox(pt);
-      if (hit >= 0) {
-        selected = hit;
-        dragging = { mode: "move", start: pt, orig: { ...regions[hit] } };
+      // 选框决策：已选优先 → 顶层命中 → 边线穿透 / Alt 循环（pickRegion）。
+      // 🔴 兜底：任何异常都退回顶层命中（hitBox），绝不让点击变成「画新框」或「无反应」。
+      let target;
+      try { target = pickRegion(pt, e.altKey); } catch (err) { target = hitBox(pt); }
+      if (target >= 0) {
+        selected = target;
+        dragging = { mode: "move", start: pt, orig: { ...regions[target] } };
       } else {
         // 空白处起手 = 画新框（起点也夹回画布内：四周留白处起手不许出界）
         const sx = Math.max(0, Math.min(1, pt.x));
@@ -534,12 +692,23 @@ function buildEditor(node) {
   });
 
   canvas.addEventListener("pointermove", (e) => {
-    // 悬停反馈：手柄＝方向箭头 / 框内＝移动 / 空白＝十字。拖动中不抢。
+    // 悬停反馈：手柄＝方向箭头 / 会触发穿透或循环的层＝alias / 框内＝移动 / 空白＝十字。
+    // 拖动中不抢。
     if (!dragging) {
       const pt = toFrac(e);
       const hh = hitHandle(pt);
-      canvas.style.cursor = hh >= 0 ? HANDLE_CURSORS[hh]
-        : (hitBox(pt) >= 0 ? "move" : "crosshair");
+      if (hh >= 0) {
+        canvas.style.cursor = HANDLE_CURSORS[hh];
+        if (hoverTarget !== -1) { hoverTarget = -1; draw(); }
+        return;
+      }
+      const stack = stackAt(pt);
+      let target;
+      try { target = pickRegion(pt, e.altKey); } catch (err) { target = stack[0] ?? -1; }
+      // 仅当「会选中的不是顶层」时才高亮预览（顶层本身显而易见）
+      const ht = (target >= 0 && stack.length && target !== stack[0]) ? target : -1;
+      if (ht !== hoverTarget) { hoverTarget = ht; draw(); }
+      canvas.style.cursor = target >= 0 ? (ht >= 0 ? "alias" : "move") : "crosshair";
       return;
     }
     const pt = toFrac(e);
@@ -717,11 +886,17 @@ function buildEditor(node) {
     }
     regions.forEach((r, i) => {
       const item = el("div", `jbee-item${i === selected ? " on" : ""}`);
+      // 整个列表项都可拖动排序（拖动 ⇄ 点按 自动区分）；grip 仅作视觉提示。
+      const grip = el("span", "jbee-grip", "⋮⋮");
+      grip.title = "拖动整行调整层级顺序";
+      item.appendChild(grip);
       item.appendChild(el("span", "no", String(i + 1).padStart(2, "0")));
       const label = r.type === "text" && r.text ? `"${r.text}" ${r.desc || ""}`.trim() : (r.desc || "(无描述)");
       item.appendChild(el("span", "tx", label));
       const del = el("span", "del", "✕");
       del.title = "删除这个框";
+      // 🔴 删除按钮：pointerdown 拦在 item 之前，避免误触发整行拖拽
+      del.addEventListener("pointerdown", (e) => e.stopPropagation());
       del.addEventListener("click", (e) => {
         e.stopPropagation();
         regions.splice(i, 1);
@@ -730,14 +905,77 @@ function buildEditor(node) {
         commit();
       });
       item.appendChild(del);
-      item.addEventListener("click", () => {
-        selected = i;
-        syncProps();
-        draw();
-      });
+      // 整行 pointerdown ⇒ 起点拖拽；移动超阈值即排序，否则 pointerup 视为点按选中
+      item.addEventListener("pointerdown", (e) => startListDrag(e, i, item));
       list.appendChild(item);
     });
     syncNodeHeight();
+  }
+
+  /* —— 列表拖拽排序（调整层级）：拖动任意列表项重排 regions（列表序＝z 序＝叠放顺序） —— */
+  function startListDrag(e, fromIdx, itemEl) {
+    if (e.target.classList.contains("del")) return;   // 删除按钮不触发拖拽
+    if (regions.length < 2) {
+      // 单框无需排序：仅记录，pointerup 时按「点按」选中该框
+      gripDragging = { fromIdx, itemEl, startY: e.clientY, moved: false, reorder: false };
+    } else {
+      e.preventDefault();
+      e.stopPropagation();
+      gripDragging = {
+        fromIdx, itemEl, startY: e.clientY, moved: false, reorder: true,
+        items: Array.from(list.children).filter((c) => c.classList.contains("jbee-item") && c !== itemEl),
+      };
+      itemEl.classList.add("dragging");
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) { /* 忽略 */ }
+      window.addEventListener("pointermove", onListDragMove);
+    }
+    window.addEventListener("pointerup", onListDragUp);
+  }
+  function onListDragMove(e) {
+    if (!gripDragging || !gripDragging.reorder) return;
+    if (!gripDragging.moved && Math.abs(e.clientY - gripDragging.startY) > 4) gripDragging.moved = true;
+    if (!gripDragging.moved) return;            // 未越过阈值前不显示指示，保留点按手感
+    gripDragging.items.forEach((it) => it.classList.remove("drop-before", "drop-after"));
+    const y = e.clientY;
+    let targetIdx = gripDragging.items.length;
+    for (let k = 0; k < gripDragging.items.length; k++) {
+      const rc = gripDragging.items[k].getBoundingClientRect();
+      if (y < rc.top + rc.height / 2) { targetIdx = k; break; }
+    }
+    gripDragging.targetIdx = targetIdx;
+    const mark = targetIdx < gripDragging.items.length
+      ? gripDragging.items[targetIdx]
+      : gripDragging.items[gripDragging.items.length - 1];
+    mark.classList.add(targetIdx < gripDragging.items.length ? "drop-before" : "drop-after");
+  }
+  function onListDragUp(e) {
+    if (!gripDragging) return;
+    const { fromIdx, itemEl, moved, reorder } = gripDragging;
+    window.removeEventListener("pointerup", onListDragUp);
+    window.removeEventListener("pointermove", onListDragMove);
+    itemEl.classList.remove("dragging");
+    if (gripDragging.items) gripDragging.items.forEach((it) => it.classList.remove("drop-before", "drop-after"));
+    gripDragging = null;
+    if (moved && reorder && regions.length >= 2) {
+      // 依据所有 item 的几何位置算插入点（含被拖项本身），与拖拽中的指示一致
+      const allItems = Array.from(list.children).filter((c) => c.classList.contains("jbee-item"));
+      const y = e.clientY;
+      let ins = allItems.length;
+      for (let k = 0; k < allItems.length; k++) {
+        const rc = allItems[k].getBoundingClientRect();
+        if (y < rc.top + rc.height / 2) { ins = k; break; }
+      }
+      const [movedRegion] = regions.splice(fromIdx, 1);
+      if (ins > fromIdx) ins -= 1;             // 移除源位置后，后续索引整体左移一位
+      regions.splice(ins, 0, movedRegion);
+      selected = regions.indexOf(movedRegion);
+      commit();
+      return;
+    }
+    // 没拖动（点按）⇒ 选中该框
+    selected = fromIdx;
+    syncProps();
+    draw();
   }
 
   function syncStatus() {
@@ -912,7 +1150,10 @@ function buildEditor(node) {
    * 顺带压制官方节点体预览（原生 image_upload 机制每帧都可能回填，见上方说明）。 */
   let lastUp = null;
   let lastComboVal = undefined;
+  let lastDims = null;
+  let lastCurDims = null;
   function poll() {
+    if (gripDragging) return;   // 列表拖拽排序进行中：不动列表 DOM，避免打断拖拽
     suppressNativePreview();
     const up = upstreamImageEl(node);
     const v = getWidget(node, W_IMAGE)?.value;
@@ -920,6 +1161,26 @@ function buildEditor(node) {
       lastUp = up;
       lastComboVal = v;
       refreshImage();
+    }
+    // 画布宽度/高度（手动改 或 上游链接回传值变化）⇒ 重拟合画布 + 刷新「画布 W×H」读数。
+    // 链接态下把实时值记作权威尺寸 node._jbeDims，避免上游回传前回落到默认值。
+    const d = panelDims();
+    if (!lastDims || d[0] !== lastDims[0] || d[1] !== lastDims[1]) {
+      lastDims = d;
+      if (inputLinked(W_WIDTH)) node._jbeDims = d;
+      fit();
+      syncStatus();
+      draw();
+    }
+    // 上游广播的实际输出尺寸变化（如改了图像编码的缩放设置）⇒ 重拟合画布 + 刷新读数。
+    // 🔴 没这段就不算实时：改上游设置时预览图引用没换、面板尺寸也没变 ⇒ 上面两个
+    //    分支都不触发，新基准要等到下一次任意交互才生效。
+    const cd = curDims();
+    if (!lastCurDims || cd[0] !== lastCurDims[0] || cd[1] !== lastCurDims[1]) {
+      lastCurDims = cd;
+      fit();
+      syncStatus();
+      draw();
     }
   }
 
@@ -972,6 +1233,69 @@ function buildEditor(node) {
       for (const r of fresh) regions.push(r);
       selected = regions.length ? 0 : -1;
       boundTextRegion = null;   // 选区对象换了，强制输入框按新内容回填
+      commit();
+    },
+    // 「边界框」端口灌入的框（后端在编辑器为空时 seed，经 ui.boxes 送达）：
+    // 整体替换编辑器内容并落盘，之后即视为手画的框（后端见到非空框数据不再灌）。
+    loadSeeded: (seeded) => {
+      if (!Array.isArray(seeded) || !seeded.length) return;
+      regions.length = 0;
+      for (const r of seeded) {
+        regions.push({
+          x: Number(r.x) || 0,
+          y: Number(r.y) || 0,
+          w: Number(r.w) || 0,
+          h: Number(r.h) || 0,
+          type: r.type === "text" ? "text" : "obj",
+          text: String(r.text || ""),
+          desc: String(r.desc || ""),
+          palette: Array.isArray(r.palette) ? r.palette.slice(0, 5) : [],
+        });
+      }
+      selected = 0;
+      boundTextRegion = null;
+      commit();
+    },
+    // 「布局导入」端口回填：整体描述写进文本框控件，各框整体替换编辑器内容并落盘。
+    // 后端仅在「布局导入」非空时经 ui.layout 送达；值为 {caption, regions} JSON 字符串。
+    loadLayout: (raw) => {
+      let data;
+      try { data = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (e) { return; }
+      if (!data || typeof data !== "object") return;
+      const caption = String(data.caption || "");
+      const regs = Array.isArray(data.regions) ? data.regions : [];
+      // 文本框（整体描述）回填：直接写控件值，运行时 setValue 不会被 Vue 重置
+      try {
+        const wp = getWidget(node, W_PROMPT);
+        if (wp) {
+          wp.value = caption;
+          // DOM 同步：Vue 组件只在挂载时读一次 widget.value，运行时必须手动写回 textarea，
+          // 否则控件值与界面显示不一致（序列化是对的，但用户看不到导入结果）。
+          const el = wp.element;
+          const ta = (el && el.matches && el.matches("textarea")) ? el
+            : (el && el.querySelector ? el.querySelector("textarea") : null);
+          if (ta && ta.value !== caption) {
+            ta.value = caption;
+            try { ta.dispatchEvent(new Event("input", { bubbles: true })); } catch (e) { /* 忽略 */ }
+          }
+        }
+      } catch (e) { /* 忽略 */ }
+      regions.length = 0;
+      for (const r of regs) {
+        if (!r || typeof r !== "object") continue;
+        regions.push({
+          x: Number(r.x) || 0,
+          y: Number(r.y) || 0,
+          w: Number(r.w) || 0,
+          h: Number(r.h) || 0,
+          type: r.type === "text" ? "text" : "obj",
+          text: String(r.text || ""),
+          desc: String(r.desc || ""),
+          palette: Array.isArray(r.palette) ? r.palette.slice(0, 5) : [],
+        });
+      }
+      selected = regions.length ? 0 : -1;
+      boundTextRegion = null;
       commit();
     },
     destroy: () => { try { ro.disconnect(); } catch (e) { /* 忽略 */ } },
@@ -1091,6 +1415,52 @@ function ensureComboLabel(node) {
   } catch (e) { /* 忽略 */ }
 }
 
+/** 把「整体描述」显示名从内部键名改成更易懂的「画面描述」（借 widget.label 覆盖，
+ *  不影响内部序列化键名，重载/撤销时 ComfyUI 仍按原名还原，无需三层取数）。 */
+function ensurePromptLabel(node) {
+  try {
+    const w = getWidget(node, W_PROMPT);
+    if (w && w.label !== "画面描述") w.label = "画面描述";
+  } catch (e) { /* 忽略 */ }
+}
+
+/** 「画面描述」文本框固定为小尺寸、且**不随节点缩放撑大**：
+ *  🔴 根因：该 multiline 控件是「可增长控件」，靠 h-full 填满被分配到的槽位。
+ *     只压 min-height → 节点放大时槽位涨高、textarea 跟着撑大（占满空间）；节点缩小时
+ *     槽位低于地板、textarea 溢出盖住下方。两种症状同源。
+ *  🔴 修法：① 覆盖 computeLayoutSize 返回固定 min==max，自由空间分配时它分到的额外
+ *     空间为 0，放大节点多出的高度全部给下方编辑器（画布+列表）；② 给容器打 .jbee-prompt
+ *     类（CSS !important 写死内部 textarea 高度）+ 直接写死内联高度，双保险防 Vue 组件
+ *     重建冲掉样式。组件挂载可能重建 textarea，故 onNodeCreated 与 onConfigure 的 rAF 各应用一次。 */
+function shrinkPromptBox(node) {
+  // 「画面描述」是可增长 multiline，要压成固定小槽位：
+  // 否则独占 ~170px，编辑器被顶下去，节点初始高度虚高。
+  // （「布局导入」已改为纯输入端口，没有文本框，无需处理。）
+  shrinkTextBox(node, W_PROMPT, PROMPT_SLOT_H, PROMPT_TA_H);
+}
+function shrinkTextBox(node, wName, slotH, taH) {
+  try {
+    const w = getWidget(node, wName);
+    if (!w) return;
+    // ① 不增长：min==max ⇒ 自由空间分配时该控件分到的额外高度为 0
+    w.computeLayoutSize = () => ({ minHeight: slotH, maxHeight: slotH, minWidth: 0 });
+    // ② 兜底：打类 + 写死内部 textarea 高度（防组件重建冲掉）
+    const H = taH + "px";
+    const fix = (el) => {
+      if (!el || !el.style) return;
+      el.classList && el.classList.add("jbee-prompt");
+      const ta = (el.matches && el.matches("textarea")) ? el
+        : (el.querySelector ? el.querySelector("textarea") : null);
+      if (ta) {
+        ta.style.height = H; ta.style.minHeight = H; ta.style.maxHeight = H;
+        ta.style.resize = "none"; ta.style.overflow = "auto";
+      }
+    };
+    fix(w.element);
+    fix(w.inputEl);
+  } catch (e) { /* 忽略 */ }
+}
+
 /* ============================ 节点集成 ============================ */
 app.registerExtension({
   name: "Josia.BBoxEdit",
@@ -1104,6 +1474,8 @@ app.registerExtension({
       try {
         if (this.size) this.size[0] = Math.max(this.size[0], NODE_MIN_W);
         ensureComboLabel(this);
+        ensurePromptLabel(this);
+        shrinkPromptBox(this);
         // buildEditor 内部 commit 会刷新画布/列表；节点高度按列表差值联动（syncNodeHeight），
         // 画布高度不参与联动、不会被重置。
         buildEditor(this);
@@ -1137,6 +1509,8 @@ app.registerExtension({
           try {
             this._jbeEditor?.refresh();
             this._jbeEditor?.reload();
+            ensurePromptLabel(this);
+            shrinkPromptBox(this);
           } catch (e) { /* 忽略 */ }
         });
       } catch (e) { /* 忽略 */ }
@@ -1148,6 +1522,34 @@ app.registerExtension({
     nodeType.prototype.onConnectionsChange = function () {
       const r = onConnectionsChange?.apply(this, arguments);
       try { this._jbeEditor?.refresh(); } catch (e) { /* 忽略 */ }
+      return r;
+    };
+
+    // 执行后：「边界框」端口灌入的框（后端仅在编辑器为空时 seed）落进编辑器。
+    // 护栏：只在编辑器当前为空时应用——用户已手画框时绝不被端口数据覆盖。
+    // 同时把后端回传的权威分辨率（上游连线即上游值、手动即面板值）写入 node._jbeDims，
+    // 编辑器 curDims 优先采用 ⇒ 连分辨率选择器 + 点播放后画布实时跟上。
+    const onExecuted = nodeType.prototype.onExecuted;
+    nodeType.prototype.onExecuted = function (message) {
+      const r = onExecuted?.apply(this, arguments);
+      try {
+        const dims = message?.dims;
+        if (Array.isArray(dims) && dims.length === 2
+            && Number.isFinite(+dims[0]) && Number.isFinite(+dims[1])) {
+          this._jbeDims = [+dims[0], +dims[1]];
+        }
+        const ed = this._jbeEditor;
+        const raw = message?.boxes?.[0];
+        if (ed && raw && ed.getRegions().length === 0) {
+          const seeded = JSON.parse(raw);
+          if (Array.isArray(seeded) && seeded.length) ed.loadSeeded(seeded);
+        }
+        // 「布局导入」回填：整体替换编辑器内容（覆盖现有框，符合「导入即还原」语义）
+        // 🔴 ui 值一律是数组（后端已包一层），裸字符串会被服务端逐字符拆开 ⇒ 取 [0]
+        const rawLayout = Array.isArray(message?.layout) ? message.layout[0] : (message?.layout || "");
+        if (ed && rawLayout) ed.loadLayout(rawLayout);
+        ed?.refresh();
+      } catch (e) { /* 忽略 */ }
       return r;
     };
 
