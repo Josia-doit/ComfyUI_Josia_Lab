@@ -10,24 +10,37 @@ BOUNDING_BOXES 自定义控件，由 Vue 组件渲染成一块画布。经典 Li
 **原样产出官方那三种数据格式**，所以下游（Flux 3 Image / MOSS-Image Layout
 Prompt / Layers 等）照接不误。
 
-三种数据格式与官方 CreateBoundingBoxes 完全一致（源码 comfy_extras/
+三种数据格式与官方 CreateBoundingBoxes 对齐（源码 comfy_extras/
 nodes_bounding_boxes.py）：
 
-  · 编辑器状态  [{x, y, w, h, type, text, desc, palette}]   归一化 0~1 浮点
+  · 编辑器状态  [{x, y, w, h, type, text, desc}]          归一化 0~1 浮点
   · bboxes      [[{x, y, width, height, metadata:{...}}]]   像素整数、双层 list
-  · elements    [{type, bbox:[ymin,xmin,ymax,xmax], text, desc, color_palette}]
+  · elements    [{type, bbox:[ymin,xmin,ymax,xmax], text, desc}]
                 bbox 为 0~1000 的整数网格、顺序是 yxyx
 
+🔴 颜色与选区彻底解耦：画布上每个框的显示色只由**框的序号**决定，是纯前端
+视觉标识；预览图里也按序号上同一套色，方便分辨不同框。颜色不写进编辑器状态、
+不进后端、不进任何输出端口。官方的 color_palette 是用户在属性面板里主动声明的
+「配色意图」（可选字段，下游用 `if el.get("color_palette")` 读取）；本节点不提供
+配色约束，因此 elements 与提示词里都不带该字段，下游照接不误。
+
 「提示词」输出 ＝「整体描述」控件 + 各框描述，按官方 MOSS-Image Layout Prompt
-同款结构打包（源码 comfy_extras/nodes_moss_image.py）：
+同款结构打包（源码 comfy_extras/nodes_moss_image.py），另带一项画布尺寸元数据：
 
   {"summary":{"caption":总体描述},
-   "items":[{"label":"object"|"text","caption":描述[,"text":文字][,"palette":[色]],
+   "items":[{"label":"object"|"text","caption":描述[,"text":文字],
              "bbox":[y_min,x_min,y_max,x_max]}],
-   "bbox_coord_space":"abs_centralized","bbox_format":"yxyx"}
+   "bbox_coord_space":"abs_centralized","bbox_format":"yxyx",
+   "canvas_size":[宽,高]}
 
 bbox 是相对画布中心的像素边（与官方逐行同式的 floor/ceil + 中心原点换算）；
 没有任何框时退化为纯「整体描述」文本（官方同款行为）。
+
+🔴 官方布局 JSON **没有尺寸字段**，但 bbox 依赖画布宽高才能反算。所以本节点
+额外写入 canvas_size：下游出图节点只按已知键读取（MOSS 官方 / KJNodes 的
+_layout_to_boxes 都是 cap.get("items") 这类取值，额外键不影响），「布局导入」
+则据此还原坐标并把画布对齐到布局原本的分辨率。画布尺寸由「宽高比 / 百万
+像素 / 对齐倍数」三项算出，公式与官方 ResolutionSelector 一致。
 
 「边界框」输入端口（BOUNDING_BOXES，类型同官方 CreateBoundingBoxes 的 bboxes
 输出）用于反向灌数：接上游的框，编辑器为空时自动按画布尺寸归一化后落进编辑器。
@@ -57,14 +70,39 @@ NODE_CATEGORY = "⚡️Josia实验区/框选编辑"
 PREVIEW_DIM = 0.25
 
 # 与前端共用的控件名 / 隐藏数据控件名。前端按名字找控件回填，两边必须一致。
-WIDTH = "画布宽度"
-HEIGHT = "画布高度"
-STATE = "框数据"
 PROMPT = "整体描述"
+ASPECT = "宽高比"
+MEGAPIXELS = "百万像素"
+MULTIPLE = "对齐倍数"
+STATE = "框数据"
 BBOX_INPUT = "边界框"
 
 MAX_DIM = 16384
 MIN_DIM = 64
+
+# 画布尺寸由「宽高比 / 百万像素 / 对齐倍数」三项算出，公式与官方
+# ResolutionSelector（comfy_extras/nodes_resolution.py）逐行一致：
+#   scale = sqrt(MP * 1024² / (w比 * h比))；宽 = round(w比 * scale / 倍数) * 倍数
+# 中文标签沿用主包同款叫法；前端 ASPECT_TABLE / MULTIPLE_CHOICES 必须与这里一致。
+ASPECT_TABLE = {
+    "1:1 正方形": (1, 1),
+    "2:3 竖屏": (2, 3),
+    "3:2 横屏": (3, 2),
+    "3:4 竖屏": (3, 4),
+    "4:3 横屏": (4, 3),
+    "9:16 竖屏": (9, 16),
+    "16:9 横屏": (16, 9),
+    "21:9 超宽屏": (21, 9),
+}
+ASPECT_CHOICES = list(ASPECT_TABLE)
+MULTIPLE_CHOICES = ["8", "16", "32", "64", "128"]
+DEFAULT_ASPECT = "1:1 正方形"
+DEFAULT_MP = 1.0
+DEFAULT_MULTIPLE = "16"
+
+# 布局提示词里的画布尺寸字段（本节点自带的元数据）。官方 MOSS 布局 JSON 不含尺寸，
+# 而 bbox 是相对画布中心的像素边 —— 不带尺寸就无从反算，「布局导入」会把框放歪。
+CANVAS_SIZE_KEY = "canvas_size"
 
 # 「选择图像」控件的空选项与判定集合：选中它们 ＝ 无图像来源，画布走面板分辨率
 IMAGE_PLACEHOLDER = "🖼️请选择或上传图像…"
@@ -150,7 +188,20 @@ def fractions_to_bbox_frame(boxes: list, width: int, height: int) -> list:
     return [pixels] if pixels else []
 
 
-# ============================ 颜色 ============================
+# ============================ 预览显示色（纯视觉，不参与输出）============================
+# 与前端画布同一套序号色：第 i 个框取 PREVIEW_COLORS[i % N]。
+# 颜色只用来在预览图上区分不同框，不是选区数据，也不带任何颜色语义。
+PREVIEW_COLORS = (
+    "#e05252", "#e08b3f", "#d9c441", "#5fbf5f", "#3fa9d9",
+    "#4f6fe0", "#a45fd9", "#d94f9e", "#8a8f98", "#c9ced6",
+)
+
+
+def _box_rgb(index: int):
+    """第 index 个框的显示色（RGB 三元组）。"""
+    return _hex_to_rgb(PREVIEW_COLORS[index % len(PREVIEW_COLORS)])
+
+
 def _hex_to_rgb(value: str):
     """'#rrggbb' / 'rrggbb' → (r, g, b)；认不出来就回一个中性灰，不抛。大小写通吃。"""
     text = str(value or "").strip().lstrip("#")
@@ -186,29 +237,6 @@ def _tag_fill(rgb):
     return (0, 0, 0) if (0.299 * r + 0.587 * g + 0.114 * b) > 140 else (255, 255, 255)
 
 
-def _clean_palette(values) -> list:
-    """只做形状清洗，**不动大小写**（官方 boxes_to_regions 就是原样透传 metadata.palette，
-    大写转换只发生在 build_elements 里 —— 位置必须对，否则两边输出不一致）。"""
-    if not isinstance(values, (list, tuple)):
-        return []
-    out = []
-    for item in values:
-        text = str(item or "").strip()
-        if not text:
-            continue
-        if not text.startswith("#"):
-            text = "#" + text
-        if len(text.lstrip("#")) in (3, 6):
-            out.append(text)
-    return out
-
-
-def _normalize_palette(values) -> list:
-    """官方 color_util.normalize_palette 的口径：c.upper()，最多 5 个。
-    下游可能按字符串比对颜色，大写口径必须和官方一致。"""
-    return [c.upper() for c in _clean_palette(values)][:5]
-
-
 # ============================ 文本换行 ============================
 def _font(size: int):
     try:
@@ -240,6 +268,7 @@ def parse_regions(raw: str) -> list:
 
     宽容处理：整体非法就当空列表（不因为编辑器里手滑改坏了一个字符就让整次
     执行报错），单个框不合法只丢那一个框，其余照常。
+    旧工作流保存的框数据里可能还带着颜色字段，这里一律忽略：颜色不是选区数据。
     """
     if raw is None:
         return []
@@ -284,7 +313,6 @@ def parse_regions(raw: str) -> list:
             "type": etype,
             "text": str(item.get("text", "") or ""),
             "desc": str(item.get("desc", "") or ""),
-            "palette": _clean_palette(item.get("palette", [])),
         })
     return regions
 
@@ -297,7 +325,7 @@ def seed_regions_from_bboxes(bboxes, width: int, height: int) -> list:
     list，与官方 fractions_to_bbox_frame 输出一致），按本节点画布尺寸归一化。
     源节点分辨率不同时会整体缩放——像素端口不携带尺寸信息，这是该格式的固有
     口径（KJNodes 的 MossImagePromptBuilderKJ 同款处理）。
-    单 dict（裸一个框）也认。灌入的框不带文字/描述/颜色（端口里没有）。
+    单 dict（裸一个框）也认。灌入的框不带文字/描述（端口里没有）。
     """
     if isinstance(bboxes, dict):
         frame = [bboxes]                                   # 裸单个框
@@ -323,7 +351,7 @@ def seed_regions_from_bboxes(bboxes, width: int, height: int) -> list:
         if bw <= 0 or bh <= 0:
             continue
         out.append({"x": x, "y": y, "w": bw, "h": bh,
-                    "type": "obj", "text": "", "desc": "", "palette": []})
+                    "type": "obj", "text": "", "desc": ""})
     return out
 
 
@@ -345,7 +373,7 @@ def norm_bbox(region: dict) -> list:
 
 
 def build_elements(regions: list) -> list:
-    """转成 Ideogram/Flux3/MOSS 那种 layout 元素列表。"""
+    """转成 Ideogram/Flux3/MOSS 那种 layout 元素列表（只含类型、坐标、文字与描述）。"""
     elements = []
     for region in regions:
         if not isinstance(region, dict):
@@ -355,9 +383,6 @@ def build_elements(regions: list) -> list:
         if etype == "text":
             element["text"] = region.get("text", "")
         element["desc"] = region.get("desc", "")
-        palette = _normalize_palette(region.get("palette", []))
-        if palette:
-            element["color_palette"] = palette[:5]
         elements.append(element)
     return elements
 
@@ -382,14 +407,20 @@ def build_layout_prompt(prompt: str, elements: list, width: int, height: int) ->
     nodes_moss_image.py）：
 
       {"summary":{"caption":总体描述},
-       "items":[{"label":"object"|"text","caption":框描述[,"text":渲染文字][,"palette":[色]],
+       "items":[{"label":"object"|"text","caption":描述[,"text":渲染文字],
                  "bbox":[y_min,x_min,y_max,x_max]}],
-       "bbox_coord_space":"abs_centralized","bbox_format":"yxyx"}
+       "bbox_coord_space":"abs_centralized","bbox_format":"yxyx",
+       "canvas_size":[宽,高]}
 
     bbox 由 0~1000 网格换算成**相对画布中心的像素边**（官方同款 floor/ceil +
     减半宽/半高）；label 只有 object / text 两种（官方还支持 character，那需要
     character_boxes 序号输入，本节点没有，物体的框一律 object）。
-    没有任何元素 ⇒ 退化为纯「整体描述」文本（官方同款）。
+
+    canvas_size 是本节点额外带的画布尺寸元数据：官方没有这个键，但 bbox 是相对
+    画布中心的像素边，缺了尺寸「布局导入」就无法反算。下游按已知键取值，额外键
+    不影响。提示词只描述「哪里、是什么」，不带任何颜色字段：颜色是编辑器里的
+    视觉标识，不是给模型的配色指令。官方 MOSSImageLayoutPrompt 的 palette 是可选
+    读取，缺该字段完全兼容。没有任何元素 ⇒ 退化为纯「整体描述」文本（官方同款）。
     """
     items = []
     for el in elements:
@@ -399,8 +430,6 @@ def build_layout_prompt(prompt: str, elements: list, width: int, height: int) ->
         item = {"label": label, "caption": el.get("desc", "") or ""}
         if label == "text":
             item["text"] = el.get("text", "") or ""
-        if el.get("color_palette"):
-            item["palette"] = el["color_palette"]
         y0, x0, y1, x1 = el["bbox"]
         item["bbox"] = [
             math.floor(round(y0 * height / 1000, 9)) - height // 2,
@@ -412,7 +441,8 @@ def build_layout_prompt(prompt: str, elements: list, width: int, height: int) ->
     if not items:
         return prompt
     layout = {"summary": {"caption": prompt.strip()}, "items": items,
-              "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx"}
+              "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx",
+              CANVAS_SIZE_KEY: [int(width), int(height)]}
     return json.dumps(layout, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -421,11 +451,16 @@ def parse_layout_prompt(text: str, width: int, height: int) -> dict | None:
 
     支持两种输入：
       · 本节点 / MOSS 产出的 JSON（{summary:{caption}, items:[{label,caption,
-        text?,palette?,bbox:[y_min,x_min,y_max,x_max 0~1000 abs_centralized]}]}）；
+        text?,bbox:[y_min,x_min,y_max,x_max abs_centralized]}], canvas_size:[w,h]}）；
       · 任意纯文本（非 JSON）⇒ 整段当作整体描述，清空框。
 
-    坐标逆换算与 build_layout_prompt 严格互逆：grid = (abs_centered + dim//2)/dim*1000。
-    返回 None 表示「空输入，不导入」（调用方据此跳过覆盖，原编辑器内容不动）。
+    外部 JSON 里若带有 palette 颜色字段一律忽略，只还原坐标与文本。
+
+    🔴 坐标逆换算的基准尺寸优先取 JSON 自带的 canvas_size —— bbox 是「相对画布
+    中心的像素边」，生成它的画布多大就用多大反算，否则框会整体偏位。旧布局 /
+    官方 MOSS 输出没有这个键 ⇒ 回落到调用方给的当前画布尺寸。
+    逆换算与 build_layout_prompt 严格互逆：grid = (abs_centered + dim//2)/dim*1000。
+    返回 {"caption", "regions", "dims": [w,h]|None}；返回 None 表示「空输入不导入」。
     """
     text = (text or "").strip()
     if not text:
@@ -434,9 +469,20 @@ def parse_layout_prompt(text: str, width: int, height: int) -> dict | None:
         data = json.loads(text)
     except (ValueError, TypeError):
         # 非 JSON：整段当整体描述，无框
-        return {"caption": text, "regions": []}
+        return {"caption": text, "regions": [], "dims": None}
     if not isinstance(data, dict):
         return None
+
+    # 布局自带的画布尺寸：反算 bbox 的唯一正确基准（官方 MOSS 输出无此键）
+    dims = None
+    raw_dims = data.get(CANVAS_SIZE_KEY)
+    if isinstance(raw_dims, (list, tuple)) and len(raw_dims) == 2:
+        try:
+            dw, dh = int(raw_dims[0]), int(raw_dims[1])
+            if dw > 0 and dh > 0:
+                dims = [dw, dh]
+        except (TypeError, ValueError):
+            pass
 
     caption = ""
     if isinstance(data.get("summary"), dict):
@@ -449,8 +495,8 @@ def parse_layout_prompt(text: str, width: int, height: int) -> dict | None:
     items = data.get("items")
     if not isinstance(items, list):
         items = []
-    w = max(1, int(width))
-    h = max(1, int(height))
+    w = dims[0] if dims else max(1, int(width))
+    h = dims[1] if dims else max(1, int(height))
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -479,9 +525,8 @@ def parse_layout_prompt(text: str, width: int, height: int) -> dict | None:
             "type": etype,
             "text": str(it.get("text", "") or ""),
             "desc": str(it.get("caption", "") or ""),
-            "palette": _clean_palette(it.get("palette", [])),
         })
-    return {"caption": caption, "regions": regions}
+    return {"caption": caption, "regions": regions, "dims": dims}
 
 
 # ============================ 预览图 ============================
@@ -502,6 +547,9 @@ def render_preview(regions: list, width: int, height: int, bg=None):
     早期为「节点体预览不撑爆节点」压过预览长边（≤1024），但节点体底部预览
     （ui.images）早已移除，预览图端口的消费者是下游图像链路（获取图像信息 /
     布局提示词等）——压过分辩率会让像素坐标与实际画布对不上，故不再缩放。
+
+    框线、角标、文字的颜色按框序号取 PREVIEW_COLORS，只用于在图上区分不同框，
+    与任何输出数据无关。
     """
     if bg is not None:
         rw, rh = bg.size
@@ -523,8 +571,8 @@ def render_preview(regions: list, width: int, height: int, bg=None):
     for i, region in enumerate(regions):
         if not isinstance(region, dict):
             continue
-        palette = [c for c in (region.get("palette") or []) if c]
-        r, g, b = _hex_to_rgb(palette[0]) if palette else (140, 140, 140)
+        # 颜色只由序号决定，不读框数据里的任何颜色字段
+        r, g, b = _box_rgb(i)
         x1 = max(0, min(rw, round(region.get("x", 0) * rw)))
         y1 = max(0, min(rh, round(region.get("y", 0) * rh)))
         x2 = max(0, min(rw, round((region.get("x", 0) + region.get("w", 0)) * rw)))
@@ -535,14 +583,6 @@ def render_preview(regions: list, width: int, height: int, bg=None):
             y1, y2 = y2, y1
 
         draw.rectangle([x1, y1, x2, y2], outline=(r, g, b, 255), width=2)
-
-        swatches = palette[:5]
-        if swatches and (x2 - x1) > 2:
-            sh = max(5, fs // 2)
-            seg = (x2 - x1) / len(swatches)
-            for p, hexc in enumerate(swatches):
-                sx = x1 + round(p * seg)
-                draw.rectangle([sx, y1, x1 + round((p + 1) * seg), y1 + sh], fill=_hex_to_rgb(hexc))
 
         tag = str(i + 1).zfill(2)
         tw = draw.textlength(tag, font=tag_font)
@@ -565,12 +605,28 @@ def render_preview(regions: list, width: int, height: int, bg=None):
     return torch.from_numpy(arr).unsqueeze(0)
 
 
-def _dims(value, fallback: int) -> int:
+def resolve_dims(aspect, megapixels, multiple) -> tuple[int, int]:
+    """三项 ⇒ 画布像素尺寸 (w, h)。公式与官方 ResolutionSelector 一致。
+
+    🔴 round 口径必须与前端 pyRound 严格一致：Python round 在 .5 取偶，
+    JS Math.round 在 .5 向上，差一格倍数就是几十像素的画布偏差。
+    """
+    wr, hr = ASPECT_TABLE.get(str(aspect), ASPECT_TABLE[DEFAULT_ASPECT])
     try:
-        v = int(value)
+        mp = float(megapixels)
     except (TypeError, ValueError):
-        return fallback
-    return max(MIN_DIM, min(MAX_DIM, v))
+        mp = DEFAULT_MP
+    if not math.isfinite(mp) or mp <= 0:
+        mp = DEFAULT_MP
+    try:
+        mult = int(multiple)
+    except (TypeError, ValueError):
+        mult = int(DEFAULT_MULTIPLE)
+    mult = max(1, min(128, mult))
+    scale = math.sqrt(mp * 1024 * 1024 / (wr * hr))
+    w = round(wr * scale / mult) * mult
+    h = round(hr * scale / mult) * mult
+    return (max(MIN_DIM, min(MAX_DIM, w)), max(MIN_DIM, min(MAX_DIM, h)))
 
 
 class JosiaBBoxEdit:
@@ -590,10 +646,21 @@ class JosiaBBoxEdit:
                                "例如：清晨的森林里一只鹿站在溪边。\n"
                                "留空时「提示词」端口只汇总各框的描述。",
                 }),
-                # 面板分辨率：只在**没有图像来源**时用来当画布尺寸（画框的坐标网格）；
-                # 一旦有图像（上传或接上游），画布与坐标全部按图像尺寸走，这两项在前端灰化。
-                WIDTH: ("INT", {"default": 1024, "min": MIN_DIM, "max": MAX_DIM, "step": 16}),
-                HEIGHT: ("INT", {"default": 1024, "min": MIN_DIM, "max": MAX_DIM, "step": 16}),
+                # 画布分辨率三项：与官方 ResolutionSelector 同口径，尺寸由这三项算出，
+                # 不用手填宽高。只在**没有图像来源、也没导入带尺寸的布局**时生效；
+                # 有图像 / 有布局时前端灰化，画布按图像或布局的尺寸走。
+                ASPECT: (ASPECT_CHOICES, {
+                    "default": DEFAULT_ASPECT,
+                    "tooltip": "画布宽高比。配合「百万像素」决定画布大小，再按「对齐倍数」取整。",
+                }),
+                MEGAPIXELS: ("FLOAT", {
+                    "default": DEFAULT_MP, "min": 0.1, "max": 16.0, "step": 0.1,
+                    "tooltip": "目标总像素（百万）。1.0 ≈ 100 万像素，1:1 时约 1024×1024。",
+                }),
+                MULTIPLE: (MULTIPLE_CHOICES, {
+                    "default": DEFAULT_MULTIPLE,
+                    "tooltip": "把算出的宽高对齐到该倍数的整数倍（VAE / patch 常用 8 或 16）。",
+                }),
                 # 前端把框数据写成 JSON 存这里。隐藏控件，但仍然是执行必需项，
                 # 这样每次执行都会把当前编辑结果带进后端，不需要额外缓存机制。
                 STATE: ("STRING", {"default": "[]", "multiline": True}),
@@ -630,6 +697,7 @@ class JosiaBBoxEdit:
                     "forceInput": True,
                     "tooltip": "接上游一段布局提示词，还原进本节点：整体描述填进文本框，各框自动生成。\n"
                                "支持本节点「提示词」端口导出的 JSON，也支持 MOSS 同款布局 JSON；\n"
+                               "布局里带画布尺寸时自动对齐画布，并按该尺寸还原框坐标；\n"
                                "纯文本则整段当整体描述并清空各框。\n"
                                "执行（点节点播放）后生效，回填编辑器；不接线则不导入、不动现有内容。",
                 }),
@@ -642,18 +710,19 @@ class JosiaBBoxEdit:
     FUNCTION = "run"
     CATEGORY = NODE_CATEGORY
 
-    def run(self, 整体描述="", 画布宽度=1024, 画布高度=1024, 框数据="[]",
+    def run(self, 整体描述="", 宽高比=DEFAULT_ASPECT, 百万像素=DEFAULT_MP,
+            对齐倍数=DEFAULT_MULTIPLE, 框数据="[]",
             image=IMAGE_PLACEHOLDER, 底图=None, 边界框=None, 布局导入=""):
-        # 底图来源二选一，端口优先：①「底图」端口（上游图像 tensor）②「选择图像」文件。
-        # 有底图 ⇒ 画布与坐标一律按底图尺寸走（面板分辨率自动失效）；都没有 ⇒ 面板分辨率。
+        # 尺寸来源优先级：底图（实际图像）> 布局导入自带的尺寸 > 三项算出的分辨率。
+        # 有底图时预览与像素输出一律跟随实际图像；没有底图而布局带 canvas_size 时，
+        # 画布改为布局原本的分辨率，这样导入的框位与当初画它们时完全一致。
         bg = _bg_from_image(底图)
         if bg is None and str(image or "").strip() not in _EMPTY_IMAGE_VALUES:
             bg = _load_bg_file(image)
         if bg is not None:
             width, height = bg.size
         else:
-            width = _dims(画布宽度, 1024)
-            height = _dims(画布高度, 1024)
+            width, height = resolve_dims(宽高比, 百万像素, 对齐倍数)
         regions = parse_regions(框数据)
 
         # 「边界框」端口灌数：仅当编辑器为空（没有手画的框）时按画布尺寸归一化落进
@@ -670,6 +739,11 @@ class JosiaBBoxEdit:
         if str(布局导入 or "").strip():
             imported = parse_layout_prompt(str(布局导入), width, height)
         if imported is not None:
+            # 布局自带尺寸 ⇒ 画布对齐过去（有底图时底图优先，预览仍跟实际图走）。
+            # 框坐标已在 parse_layout_prompt 里按布局自身尺寸反算，不会因两边
+            # 分辨率不同而偏位；这也是「导入后选区坐标不正常」的根治点。
+            if imported.get("dims") and bg is None:
+                width, height = imported["dims"]
             整体描述 = imported["caption"]
             regions = imported["regions"]
 
@@ -690,7 +764,8 @@ class JosiaBBoxEdit:
             #    当条目列表重新拼一遍（{k:[y for x in uis for y in x[k]]}），裸字符串会被
             #    逐字符拆成字符数组（实测 156 长度），前端拿到的就不是 JSON 了。与 boxes 同规。
             ui["layout"] = [json.dumps(
-                {"caption": imported["caption"], "regions": regions}, ensure_ascii=False)]
+                {"caption": imported["caption"], "regions": regions,
+                 "dims": [width, height]}, ensure_ascii=False)]
         return {
             "ui": ui,
             "result": (prompt, preview, build_bboxes(regions, width, height), elements),

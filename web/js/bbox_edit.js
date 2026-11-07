@@ -6,18 +6,24 @@
  * 这里用「节点内嵌 DOM + 原生 canvas」自己实现，经典模式下完全可控。
  *
  * 节点布局（自上而下）：
- *   整体描述（多行提示词） / 画布宽度 / 画布高度 / 选择图像（combo）  ← 标准控件
+ *   整体描述（多行提示词） / 宽高比 / 百万像素 / 对齐倍数 / 选择图像（combo） ← 标准控件
  *   内嵌编辑器（一个 DOM widget）：
  *     [状态行 + ＋/🗑/清空] → 画布（有图＝变暗的图，无图＝网格）
- *     → 胶囊开关（物体|文字）→ 文字 / 描述 / 颜色 / 位置 → 框列表
+ *     → 胶囊开关（物体|文字）→ 文字 / 描述 / 位置 → 框列表
  *
  * 图像来源（二选一，端口优先）：
  *   · 「选择图像」下拉（内部键名 image）：input 目录图像文件；原生上传按钮传图后进本下拉
  *   · 「底图」输入端口：实时显示上游节点的预览图（上游 imgs 一变就跟着刷）
- * 有图像 ⇒ 画布/坐标按图像尺寸走，画布宽度/高度灰化；无图像 ⇒ 按面板分辨率画网格画布。
+ *
+ * 画布尺寸来源（优先级由高到低）：
+ *   ① 有图像 ⇒ 按实际图像尺寸走，三项灰化
+ *   ② 「布局导入」接入的布局自带 canvas_size ⇒ 执行后画布对齐到该尺寸，三项灰化
+ *   ③ 都没有 ⇒ 宽高比 + 百万像素 + 对齐倍数算分辨率（官方 ResolutionSelector 同款公式）
+ * 「提示词」输出带 canvas_size，布局导回本节点时框坐标按原尺寸反算，不会再错位。
  *
  * 数据流：编辑框 → 序列化成 JSON → 写进隐藏的「框数据」控件 → 后端解析。
- * 落盘的 JSON 与官方编辑器状态同构：[{x,y,w,h,type,text,desc,palette}]，坐标是 0~1 分数。
+ * 落盘的 JSON 只含执行所需字段：[{x,y,w,h,type,text,desc}]，坐标是 0~1 分数。
+ * 框的显示色按序号自动分配，是纯前端视觉标识：不落盘、不进后端、不进任何输出端口。
  * 框的顺序即层级：官方注释写明「背景元素先放、前景最后放」，这里沿用同一约定。
  *
  * 「边界框」输入端口（BOUNDING_BOXES）：接上游的框；编辑器为空时，后端在执行时
@@ -30,13 +36,27 @@ import { api } from "../../../scripts/api.js";
 const NODE_CLASS = "JosiaBBoxEdit";
 
 /* 与后端 bbox_edit.py 的控件名严格一致 */
-const W_WIDTH = "画布宽度";
-const W_HEIGHT = "画布高度";
+const W_ASPECT = "宽高比";
+const W_MP = "百万像素";
+const W_MULT = "对齐倍数";
 const W_STATE = "框数据";
 const W_PROMPT = "整体描述";
 const W_IMAGE = "image";
 const PORT_BG = "底图";
+const PORT_LAYOUT = "布局导入";
 const IMAGE_PLACEHOLDER = "🖼️请选择或上传图像…";
+
+/* 分辨率三项：ASPECT_TABLE 与后端 ASPECT_TABLE 逐项一致。
+ * 公式照官方 ResolutionSelector；pyRound 复刻 Python round 的 .5 取偶，
+ * 避免前后端在 .5 边界差一个对齐倍数。 */
+const ASPECT_TABLE = {
+  "1:1 正方形": [1, 1], "2:3 竖屏": [2, 3], "3:2 横屏": [3, 2],
+  "3:4 竖屏": [3, 4], "4:3 横屏": [4, 3], "9:16 竖屏": [9, 16],
+  "16:9 横屏": [16, 9], "21:9 超宽屏": [21, 9],
+};
+const DEFAULT_ASPECT = "1:1 正方形";
+const DEFAULT_MP = 1.0;
+const DEFAULT_MULT = "16";
 
 /* ============================ 尺寸常量 / 样式 ============================ */
 const ROW_H = 22;              // 本包 22px 控件规范
@@ -45,12 +65,14 @@ const HANDLE = 8;              // 缩放手柄命中半径（画布像素）
 const SNAP_PX = 7;             // 吸附容差（画布显示像素）：目标线多近就吸过去
 const EDGE_TOL = 6;            // 边线穿透选中容差（画布像素）：点距某选区边线 ≤ 此值即算「点中边线」
 /* DOM 容器固定行总高（不含画布与列表，这两块自适应）：
- * 状态22 + 胶囊22 + 文字22 + 描述22 + 颜色16 + 位置22 + 行间gap 6×6=36 + 内边距上下12 = 174 */
-const CHROME_H = 174;
+ * 状态22 + 胶囊22 + 文字22 + 描述22 + 位置22 + 行间gap 6×4=24 + 内边距上下12 = 146 */
+const CHROME_H = 146;
 const CANVAS_BASE_H = 240;     // 画布基准高（flex-grow 拉伸的起点）
-/* 列表不设高度上限、不滚动：每增/删一个选区，列表就高/矮一行，
- * 节点高度按差值同步向下生长/收缩，画布（预览区）高度始终不变。 */
-const LIST_EMPTY_H = 36;       // 空列表（提示行）的估高，只用于新节点初始尺寸
+/* 🔴 列表恒高 + 内部滚动：stage 是 flex:1，列表占位一变，画布显示区就会
+ *    被挤压/撑大，canvas 位图跟着重设 ⇒ 画框瞬间画布抖一下。
+ *    列表高度恒定 = 画布显示区恒定，零中间态，也不依赖 ComfyUI 的
+ *    DOM widget 高度更新时机（它是异步的，事后补偿来不及）。 */
+const LIST_H = 120;            // 约 5 行；超出部分列表内滚动
 /* 「画面描述」文本框固定为小尺寸且**不随节点缩放撑大**：
  * 该 multiline 控件是「可增长控件」，靠 h-full 填满被分配到的槽位。直接写死 height 会
  * 锁死（放大留白、缩小溢出）；只压 min-height 仍会随节点放大撑大。正确做法是用
@@ -60,15 +82,18 @@ const LIST_EMPTY_H = 36;       // 空列表（提示行）的估高，只用于�
 const PROMPT_TA_H = 56;
 const PROMPT_SLOT_H = 80;
 /* 节点外壳高（编辑器 DOM widget 之上的全部内容）：标题 + 输出端口区 + 标准控件
- * （画面描述多行固定 PROMPT_SLOT_H＝80；画布宽度/画布高度/图像下拉/原生上传按钮 各24）
- * + 余量。无头实测编辑器起点 y≈262（端口数/高度变化时需重新实测）。NODE_CHROME_H 仅用于
- * 新节点初始高，运行时编辑器按真实 DOM 控件 y 定位。 */
-const NODE_CHROME_H = 262;
+ * （画面描述多行固定 PROMPT_SLOT_H＝80；宽高比/百万像素/对齐倍数/图像下拉/
+ * 原生上传按钮 各24）+ 余量。NODE_CHROME_H 仅用于新节点初始高，运行时编辑器
+ * 按真实 DOM 控件 y 定位。 */
+const NODE_CHROME_H = 286;
 const NODE_MIN_W = 300;
-/* 节点初始高：外壳 + 容器固定行 + 画布基准 + 空列表 */
-const NODE_BASE_H = NODE_CHROME_H + CHROME_H + CANVAS_BASE_H + LIST_EMPTY_H;
+/* 节点初始高：ComfyUI 外壳/槽位实测约 344px + 编辑器固定行 146 + 列表恒高 120
+ * + 画布显示区 420 ⇒ 1030。列表恒高后节点不会再随框数自己长高，初始高度必须
+ * 一次给足，否则画布区会被压成窄条（实测给 792 时画布只有 182 高）。 */
+const NODE_BASE_H = 1030;
 
-/* 调色板（中文名用于悬停提示） */
+/* 选区显示色（按序号循环）：只用于画布/角标区分不同选区，不是选区数据，
+ * 不写进「框数据」，也不参与后端执行与任何输出端口。 */
 const PALETTE = [
   { hex: "#e05252", name: "红" },
   { hex: "#e08b3f", name: "橙" },
@@ -81,6 +106,11 @@ const PALETTE = [
   { hex: "#8a8f98", name: "灰" },
   { hex: "#c9ced6", name: "浅灰" },
 ];
+
+/** 第 i 个选区的显示色。颜色只由序号决定，没有需要持久化的状态。 */
+function colorOf(i) {
+  return PALETTE[((i % PALETTE.length) + PALETTE.length) % PALETTE.length].hex;
+}
 
 /**
  * 本扩展只在浏览器里做事（要 document 建 DOM）。被误 import 到非浏览器环境
@@ -122,10 +152,7 @@ const CSS = `
   height:${ROW_H}px;padding:0 6px;border-radius:4px;border:1px solid var(--border-default,#494a50);
   background:rgba(128,128,128,.14);color:inherit;font-size:11px;font-family:inherit;}
 .jbee-row input[readonly]{opacity:.7;}
-.jbee-swatches{display:flex;flex-wrap:wrap;gap:4px;flex:1 1 auto;}
-.jbee-sw{width:16px;height:16px;border-radius:4px;cursor:pointer;border:1px solid rgba(255,255,255,.25);}
-.jbee-sw.on{outline:2px solid #fff;outline-offset:1px;}
-.jbee-list{flex:0 0 auto;border-radius:6px;
+.jbee-list{flex:0 0 auto;height:${LIST_H}px;overflow-y:auto;scrollbar-width:thin;border-radius:6px;
   border:1px solid var(--border-default,#494a50);padding:3px;display:flex;flex-direction:column;gap:2px;}
 .jbee-item{display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:4px;cursor:pointer;user-select:none;
   font-size:11px;}
@@ -135,7 +162,8 @@ const CSS = `
 .jbee-item .tx{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .jbee-item .del{flex:0 0 auto;opacity:.55;cursor:pointer;padding:0 3px;}
 .jbee-item .del:hover{opacity:1;color:#e05252;}
-.jbee-empty{opacity:.55;padding:6px;text-align:center;}
+.jbee-empty{opacity:.55;padding:6px;text-align:center;flex:1 1 auto;
+  display:flex;align-items:center;justify-content:center;}
 .jbee-grip{flex:0 0 auto;cursor:grab;opacity:.45;user-select:none;touch-action:none;
   padding:0 3px;font-size:12px;line-height:1;}
 .jbee-grip:hover{opacity:.9;}
@@ -159,12 +187,6 @@ function el(tag, cls, text) {
   if (cls) e.className = cls;
   if (text != null) e.textContent = text;
   return e;
-}
-
-function hexToRgb(hex) {
-  const t = String(hex || "").replace("#", "");
-  if (t.length === 3) return `#${t[0]}${t[0]}${t[1]}${t[1]}${t[2]}${t[2]}`;
-  return `#${t.slice(0, 6).padEnd(6, "0")}`;
 }
 
 /* ============================ 图像来源 ============================ */
@@ -268,26 +290,6 @@ function buildEditor(node) {
   rowDesc.appendChild(inpDesc);
   root.appendChild(rowDesc);
 
-  /* —— 颜色 —— */
-  const rowColor = el("div", "jbee-row");
-  rowColor.appendChild(el("label", null, "颜色"));
-  const swBox = el("div", "jbee-swatches");
-  PALETTE.forEach(({ hex, name }) => {
-    const s = el("div", "jbee-sw");
-    s.style.background = hex;
-    s.dataset.hex = hex;
-    s.title = `${name} ${hex}`;
-    s.addEventListener("click", () => {
-      const r = current();
-      if (!r) return;
-      r.palette = [hex];
-      commit();
-    });
-    swBox.appendChild(s);
-  });
-  rowColor.appendChild(swBox);
-  root.appendChild(rowColor);
-
   /* —— 位置（只读回显）—— */
   const rowCoord = el("div", "jbee-row");
   rowCoord.appendChild(el("label", null, "位置"));
@@ -314,7 +316,7 @@ function buildEditor(node) {
     return !!(inp && inp.link != null);
   }
   function panelDims() {
-    return [intOf(node, W_WIDTH, 1024), intOf(node, W_HEIGHT, 1024)];
+    return resolveDims(node);
   }
   /** 「底图」端口上游节点广播的**实际输出**尺寸 [w,h]（取不到返回 null）。
    *  会缩放的节点（如图像编码）把算好的输出尺寸挂在 _jencOutSize 上。
@@ -345,9 +347,9 @@ function buildEditor(node) {
     }
     // ② 「选择图像」上传的图：预览即原文件，naturalWidth 就是实际尺寸
     if (img) return [img.naturalWidth, img.naturalHeight];
-    // ③ 分辨率选择器接了上游：执行后优先用后端回传的权威尺寸（未执行前回落面板值）
-    if (inputLinked(W_WIDTH) && node._jbeDims) return node._jbeDims;
-    // ④ 无图像 ⇒ 面板分辨率（直接读控件，手改实时生效）
+    // ③ 「布局导入」接了带尺寸的布局：执行后画布对齐到布局原本的分辨率
+    if (inputLinked(PORT_LAYOUT) && node._jbeLayoutDims) return node._jbeLayoutDims;
+    // ④ 无图像 ⇒ 三项算出的面板分辨率（改任一项实时生效）
     return panelDims();
   }
 
@@ -365,6 +367,12 @@ function buildEditor(node) {
   }
 
   function draw() {
+    // 🔴 canvas 的 CSS 是 width/height:100%，位图尺寸必须与 stage 严格一致：
+    //    位图一旦落后于容器尺寸，浏览器就把整张位图非等比拉伸 → 画布矩形比例跳变。
+    //    执行回填 / 拖节点会改容器高度，绘制前自愈一次，保证位图与容器始终等尺寸。
+    const sw = Math.max(60, stage.clientWidth || 240);
+    const sh = Math.max(CANVAS_MIN_H, stage.clientHeight || CANVAS_BASE_H);
+    if (canvas.width !== sw || canvas.height !== sh) fit();
     const w = canvas.width;
     const h = canvas.height;
     const { dx, dy, dw, dh } = fitRect;
@@ -420,7 +428,7 @@ function buildEditor(node) {
       const y = dy + r.y * dh;
       const bw = r.w * dw;
       const bh = r.h * dh;
-      const color = (r.palette && r.palette[0]) || "#8a8f98";
+      const color = colorOf(i);
       const on = i === selected;
 
       ctx.strokeStyle = color;
@@ -679,7 +687,6 @@ function buildEditor(node) {
         regions.push({
           x: sx, y: sy, w: 0, h: 0,
           type: defaultType, text: "", desc: "",
-          palette: [PALETTE[regions.length % PALETTE.length].hex],
         });
         selected = regions.length - 1;
       }
@@ -860,8 +867,6 @@ function buildEditor(node) {
       }
       const [bw, bh] = curDims();
       inpCoord.value = `${Math.round(r.x * bw)},${Math.round(r.y * bh)} ${Math.round(r.w * bw)}×${Math.round(r.h * bh)}`;
-      const cur = (r.palette && r.palette[0]) || "";
-      Array.from(swBox.children).forEach((s) => s.classList.toggle("on", hexToRgb(s.dataset.hex) === hexToRgb(cur)));
     } else {
       if (boundTextRegion !== null) {
         inpText.value = "";
@@ -869,7 +874,6 @@ function buildEditor(node) {
         boundTextRegion = null;
       }
       inpCoord.value = "";
-      Array.from(swBox.children).forEach((s) => s.classList.remove("on"));
     }
     btnDel.disabled = !has;
     btnClear.disabled = regions.length === 0;
@@ -881,7 +885,6 @@ function buildEditor(node) {
     list.textContent = "";
     if (!regions.length) {
       list.appendChild(el("div", "jbee-empty", "还没有框。在画布空白处拖一下就能画。"));
-      syncNodeHeight();
       return;
     }
     regions.forEach((r, i) => {
@@ -909,7 +912,6 @@ function buildEditor(node) {
       item.addEventListener("pointerdown", (e) => startListDrag(e, i, item));
       list.appendChild(item);
     });
-    syncNodeHeight();
   }
 
   /* —— 列表拖拽排序（调整层级）：拖动任意列表项重排 regions（列表序＝z 序＝叠放顺序） —— */
@@ -997,26 +999,11 @@ function buildEditor(node) {
     return `${Math.max(0, Math.round((x2 - x1) * bw))}×${Math.max(0, Math.round((y2 - y1) * bh))}`;
   }
 
-  /* 容器最小内容高：固定行(CHROME_H) + 画布基准(CANVAS_BASE_H) + 列表当前高。
-   * 列表自然生长（不设上限），getMinHeight 跟着实时走，保证节点拖不进内容以下。 */
-  function domContentH() {
-    return CHROME_H + CANVAS_BASE_H + (list.offsetHeight || 0);
-  }
-
-  /* 🔴 列表高度 ⇒ 节点高度按差值联动：新增选区节点向下生长一行、删除则缩回一行，
-   *    画布（预览区）高度始终不变 —— 改的只是节点总高，绝不重置画布。
-   *    首次调用只记录基线（工作流重载时保持已保存的节点尺寸，不跳变）。 */
-  let lastListH = 0;
-  function syncNodeHeight() {
-    const h = list.offsetHeight || 0;
-    if (!lastListH) { lastListH = h; return; }
-    const d = h - lastListH;
-    lastListH = h;
-    if (d && node.size) {
-      node.size[1] = Math.max(300, node.size[1] + d);
-      node.setDirtyCanvas?.(true, true);
-    }
-  }
+/* 容器最小内容高：固定行 + 画布基准 + 列表恒高。列表不随框数变化，
+ * 这个下限也是一个常量，节点高度与画布显示区都不需要任何异步联动。 */
+function domContentH() {
+  return CHROME_H + CANVAS_BASE_H + LIST_H;
+}
 
   function commit() {
     saveRegions(node, regions);
@@ -1025,8 +1012,7 @@ function buildEditor(node) {
     syncStatus();
     syncGrays(node);
     draw();
-    // 节点高度联动在 syncList → syncNodeHeight 里做：列表增删一行，节点按差值
-    // 向下生长/收缩一行，画布（预览区）高度始终不变 —— 绝不整体重置节点尺寸。
+    // 列表恒高，增删框不改变任何布局尺寸：画布显示区从第一帧到最后一帧都不动。
   }
 
   capObj.addEventListener("click", () => setType("obj"));
@@ -1068,7 +1054,6 @@ function buildEditor(node) {
     regions.push({
       x: 0.35, y: 0.35, w: s, h: s,
       type: defaultType, text: "", desc: "",
-      palette: [PALETTE[regions.length % PALETTE.length].hex],
     });
     selected = regions.length - 1;
     commit();
@@ -1162,12 +1147,10 @@ function buildEditor(node) {
       lastComboVal = v;
       refreshImage();
     }
-    // 画布宽度/高度（手动改 或 上游链接回传值变化）⇒ 重拟合画布 + 刷新「画布 W×H」读数。
-    // 链接态下把实时值记作权威尺寸 node._jbeDims，避免上游回传前回落到默认值。
+    // 分辨率三项任一改变 ⇒ 重拟合画布 + 刷新「画布 W×H」读数。
     const d = panelDims();
     if (!lastDims || d[0] !== lastDims[0] || d[1] !== lastDims[1]) {
       lastDims = d;
-      if (inputLinked(W_WIDTH)) node._jbeDims = d;
       fit();
       syncStatus();
       draw();
@@ -1180,6 +1163,7 @@ function buildEditor(node) {
       lastCurDims = cd;
       fit();
       syncStatus();
+      syncGrays(node);
       draw();
     }
   }
@@ -1189,8 +1173,8 @@ function buildEditor(node) {
   const ro = new ResizeObserver(() => { fit(); draw(); });
   ro.observe(stage);
 
-  // 面板分辨率控件变化 ⇒ 无图模式下的画布网格要跟着变
-  for (const nm of [W_WIDTH, W_HEIGHT]) {
+  // 分辨率三项任一变化 ⇒ 无图模式下的画布网格要跟着变
+  for (const nm of [W_ASPECT, W_MP, W_MULT]) {
     const w = getWidget(node, nm);
     if (!w) continue;
     const prev = w.callback;
@@ -1222,7 +1206,11 @@ function buildEditor(node) {
   node._jbeEditor = {
     // 🔴 tick ＝ 每帧轻探（只比对引用/值，没变化零开销）；refresh ＝ 全量重刷
     tick: poll,
-    refresh: () => { poll(); fit(); syncProps(); syncStatus(); draw(); },
+    // 当前画布尺寸（只读）：三项 / 图像 / 布局尺寸三路优先级的实际结果
+    getDims: () => curDims(),
+    // 🔴 灰化状态必须跟着一起刷：断线 / 执行走的都是 refresh，
+    //    只挂在 commit 里的话「断开布局端口」后三项会一直灰着，直到用户去动一下画布。
+    refresh: () => { poll(); fit(); syncProps(); syncStatus(); syncGrays(node); draw(); },
     // 🔴 reload ＝ 从隐藏控件重新读框数据并整体替换 regions。
     //    buildEditor 里的 loadRegions 只发生在节点**建成那一刻**——那时 configure
     //    还没回填控件值，读到的是默认 "[]"。撤销 / 刷新 / loadGraphData 后控件值
@@ -1249,7 +1237,6 @@ function buildEditor(node) {
           type: r.type === "text" ? "text" : "obj",
           text: String(r.text || ""),
           desc: String(r.desc || ""),
-          palette: Array.isArray(r.palette) ? r.palette.slice(0, 5) : [],
         });
       }
       selected = 0;
@@ -1257,13 +1244,23 @@ function buildEditor(node) {
       commit();
     },
     // 「布局导入」端口回填：整体描述写进文本框控件，各框整体替换编辑器内容并落盘。
-    // 后端仅在「布局导入」非空时经 ui.layout 送达；值为 {caption, regions} JSON 字符串。
+    // 后端仅在「布局导入」非空时经 ui.layout 送达；值为 {caption, regions, dims}。
     loadLayout: (raw) => {
       let data;
       try { data = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (e) { return; }
       if (!data || typeof data !== "object") return;
       const caption = String(data.caption || "");
       const regs = Array.isArray(data.regions) ? data.regions : [];
+      // 布局自带的画布尺寸 ⇒ 记成权威尺寸，画布按它走（三项随即灰化）。
+      // 没有尺寸字段的旧布局 / 纯文本 ⇒ 清掉覆盖，回落到三项。
+      const dims = data.dims;
+      if (Array.isArray(dims) && dims.length === 2
+          && Number.isFinite(+dims[0]) && Number.isFinite(+dims[1])
+          && +dims[0] > 0 && +dims[1] > 0) {
+        node._jbeLayoutDims = [+dims[0], +dims[1]];
+      } else {
+        delete node._jbeLayoutDims;
+      }
       // 文本框（整体描述）回填：直接写控件值，运行时 setValue 不会被 Vue 重置
       try {
         const wp = getWidget(node, W_PROMPT);
@@ -1291,14 +1288,15 @@ function buildEditor(node) {
           type: r.type === "text" ? "text" : "obj",
           text: String(r.text || ""),
           desc: String(r.desc || ""),
-          palette: Array.isArray(r.palette) ? r.palette.slice(0, 5) : [],
         });
       }
       selected = regions.length ? 0 : -1;
       boundTextRegion = null;
       commit();
     },
-    destroy: () => { try { ro.disconnect(); } catch (e) { /* 忽略 */ } },
+    destroy: () => {
+      try { ro.disconnect(); } catch (e) { /* 忽略 */ }
+    },
     // 调试/无头回归句柄（只读 live 引用 + 最小操作，不暴露内部赋值）
     getRegions: () => regions,
     getSelected: () => selected,
@@ -1328,10 +1326,29 @@ function getWidget(node, name) {
   return node.widgets ? node.widgets.find((w) => w.name === name) : null;
 }
 
-function intOf(node, name, fallback) {
-  const w = getWidget(node, name);
-  const v = parseInt(w?.value, 10);
-  return Number.isFinite(v) && v > 0 ? v : fallback;
+/* Python round 的 .5 取偶（x 恒为正），与后端 resolve_dims 的 round 严格对齐。 */
+function pyRound(x) {
+  const f = Math.floor(x);
+  const frac = x - f;
+  if (frac < 0.5) return f;
+  if (frac > 0.5) return f + 1;
+  return (f % 2 === 0) ? f : f + 1;
+}
+
+/* 三项 ⇒ 画布尺寸 [w,h]：与后端 resolve_dims / 官方 ResolutionSelector 同式。
+ * 控件缺失 / 值异常一律回落到默认档，绝不因为一个坏值让画布尺寸变 NaN。 */
+function resolveDims(node) {
+  const key = String(getWidget(node, W_ASPECT)?.value ?? DEFAULT_ASPECT);
+  const ratio = ASPECT_TABLE[key] || ASPECT_TABLE[DEFAULT_ASPECT];
+  let mp = Number(getWidget(node, W_MP)?.value);
+  if (!Number.isFinite(mp) || mp <= 0) mp = DEFAULT_MP;
+  let mult = parseInt(getWidget(node, W_MULT)?.value, 10);
+  if (!Number.isFinite(mult) || mult <= 0) mult = parseInt(DEFAULT_MULT, 10);
+  mult = Math.max(1, Math.min(128, mult));
+  const scale = Math.sqrt(mp * 1024 * 1024 / (ratio[0] * ratio[1]));
+  const w = pyRound(ratio[0] * scale / mult) * mult;
+  const h = pyRound(ratio[1] * scale / mult) * mult;
+  return [Math.max(64, Math.min(16384, w)), Math.max(64, Math.min(16384, h))];
 }
 
 /** 框数据三层取数：
@@ -1363,7 +1380,7 @@ function loadRegions(node, info) {
 function saveRegions(node, regions) {
   const w = getWidget(node, W_STATE);
   if (!w) return;
-  // 只存需要执行的字段，别把前端临时状态带进去
+  // 只存需要执行的字段；显示色由序号推导，属于前端临时状态，绝不落盘
   const clean = regions.map((r) => ({
     x: Number(r.x) || 0,
     y: Number(r.y) || 0,
@@ -1372,7 +1389,6 @@ function saveRegions(node, regions) {
     type: r.type === "text" ? "text" : "obj",
     text: String(r.text || ""),
     desc: String(r.desc || ""),
-    palette: Array.isArray(r.palette) ? r.palette.slice(0, 5) : [],
   }));
   w.value = JSON.stringify(clean);
   // 🔴 properties 双写：widgets_values 在部分还原路径（真实 tab 切换 / 撤销栈快照）
@@ -1393,17 +1409,46 @@ function hideStateWidget(node) {
   if (w.element) w.element.style.display = "none";
 }
 
-/** 分辨率与图像下拉的灰化：
+/** 旧工作流（手填宽高的版本）控件序列是
+ *  [整体描述, 画布宽度, 画布高度, 框数据, image]（5 项）；
+ *  现在是 [整体描述, 宽高比, 百万像素, 对齐倍数, 框数据, image]（6 项）。
+ *  litegraph 按数组下标回填，旧值会整体错位，尤其「框数据」被图像占位符覆盖
+ *  ⇒ 画好的框全丢。这里按旧形态特征识别，把框数据与图像放回正确位置。
+ *  新工作流的下标 1 是比例字符串（不是数字），不会误判。 */
+function migrateLegacyWidgets(node, info) {
+  const vals = info && info.widgets_values;
+  if (!Array.isArray(vals) || vals.length < 4) return false;
+  if (!(typeof vals[1] === "number" && vals[1] >= 64
+        && typeof vals[2] === "number" && vals[2] >= 64
+        && typeof vals[3] === "string")) return false;
+  const set = (name, value) => {
+    const w = getWidget(node, name);
+    if (w) w.value = value;
+  };
+  set(W_ASPECT, DEFAULT_ASPECT);
+  set(W_MP, DEFAULT_MP);
+  set(W_MULT, DEFAULT_MULT);
+  set(W_STATE, vals[3]);
+  if (typeof vals[4] === "string") set(W_IMAGE, vals[4]);
+  // buildEditor 的首次 loadRegions 不传 info，只读 properties / 控件值 ⇒ 必须双写
+  try { node.properties._jbeState = vals[3]; } catch (e) { /* 忽略 */ }
+  return true;
+}
+
+/** 分辨率三项与图像下拉的灰化：
  *  · 「底图」端口接线 ⇒ 图像下拉灰化（端口优先）
- *  · 有任何图像来源（接线或下拉选中）⇒ 画布宽度/高度灰化（画布按图像尺寸走） */
+ *  · 有任何图像来源（接线或下拉选中）⇒ 三项灰化（画布按图像尺寸走）
+ *  · 「布局导入」接线且已拿到布局尺寸 ⇒ 三项灰化（画布按布局尺寸走） */
 function syncGrays(node) {
   const wired = (node.inputs || []).some((i) => i && i.name === PORT_BG && i.link != null);
   const combo = getWidget(node, W_IMAGE);
   if (combo) combo.disabled = wired;
   const uploaded = !!uploadViewURL(combo?.value);
-  for (const nm of [W_WIDTH, W_HEIGHT]) {
+  const byLayout = (node.inputs || []).some(
+    (i) => i && i.name === PORT_LAYOUT && i.link != null) && !!node._jbeLayoutDims;
+  for (const nm of [W_ASPECT, W_MP, W_MULT]) {
     const w = getWidget(node, nm);
-    if (w) w.disabled = wired || uploaded;
+    if (w) w.disabled = wired || uploaded || byLayout;
   }
 }
 
@@ -1476,10 +1521,9 @@ app.registerExtension({
         ensureComboLabel(this);
         ensurePromptLabel(this);
         shrinkPromptBox(this);
-        // buildEditor 内部 commit 会刷新画布/列表；节点高度按列表差值联动（syncNodeHeight），
-        // 画布高度不参与联动、不会被重置。
+        // buildEditor 内部 commit 会刷新画布/列表；列表恒高，画布显示区不受框数影响。
         buildEditor(this);
-        // 新节点给一个合理初始高度（外壳 + 容器固定行 + 画布基准 + 空列表）；
+        // 新节点给一个合理初始高度（外壳 + 容器固定行 + 画布基准 + 列表恒高）；
         // 已保存过尺寸的旧工作流节点不强行覆盖，保持用户/上次的布局。
         if (this.size && this.size[1] < NODE_BASE_H - 60) {
           this.size[1] = NODE_BASE_H;
@@ -1498,6 +1542,7 @@ app.registerExtension({
       const info = arguments[0];
       try {
         hideStateWidget(this);
+        migrateLegacyWidgets(this, info);
         ensureComboLabel(this);
         buildEditor(this);
         this._jbeEditor?.refresh();
@@ -1521,14 +1566,18 @@ app.registerExtension({
     const onConnectionsChange = nodeType.prototype.onConnectionsChange;
     nodeType.prototype.onConnectionsChange = function () {
       const r = onConnectionsChange?.apply(this, arguments);
+      // 「布局导入」断线 ⇒ 立刻丢弃布局尺寸覆盖，画布回到三项/图像尺寸
+      const linked = (this.inputs || []).some(
+        (i) => i && i.name === PORT_LAYOUT && i.link != null);
+      if (!linked) delete this._jbeLayoutDims;
       try { this._jbeEditor?.refresh(); } catch (e) { /* 忽略 */ }
       return r;
     };
 
     // 执行后：「边界框」端口灌入的框（后端仅在编辑器为空时 seed）落进编辑器。
     // 护栏：只在编辑器当前为空时应用——用户已手画框时绝不被端口数据覆盖。
-    // 同时把后端回传的权威分辨率（上游连线即上游值、手动即面板值）写入 node._jbeDims，
-    // 编辑器 curDims 优先采用 ⇒ 连分辨率选择器 + 点播放后画布实时跟上。
+    // 后端回传的权威分辨率写入 node._jbeDims（「底图」端口接了会缩放的上游时优先采用）；
+    // 「布局导入」的尺寸由 ui.layout.dims 交给 loadLayout 记成 _jbeLayoutDims。
     const onExecuted = nodeType.prototype.onExecuted;
     nodeType.prototype.onExecuted = function (message) {
       const r = onExecuted?.apply(this, arguments);
