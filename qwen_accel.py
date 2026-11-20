@@ -688,7 +688,7 @@ class JosiaQwenAccel:
     RETURN_TYPES = ("MODEL", "SAMPLER", "SIGMAS")
     RETURN_NAMES = ("model", "sampler", "sigmas")
     FUNCTION = "apply"
-    CATEGORY = "⚡️Josia实验区/Qwen加速"
+    CATEGORY = "⚡️Josia实验区"
     DESCRIPTION = (
         "Qwen-Image 2.1 加速 LoRA：填「选择LoRA」+ 选「加速LoRA类型」，"
         "节点自动换上对应的加载方式、采样器与 sigma，sigma 不用自己填。"

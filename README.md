@@ -20,7 +20,7 @@ ComfyUI/custom_nodes/ComfyUI_Josia_Lab/
 给 Qwen-Image 2.1 的两个官方加速 LoRA 做适配：选好文件与类型，加载方式、采样器、sigma 都由节点内部
 按类型决定，不需要手工配置。
 
-分类：`⚡️Josia实验区/Qwen加速`
+分类：`⚡️Josia实验区`
 
 **必填**
 
@@ -68,7 +68,7 @@ ComfyUI/custom_nodes/ComfyUI_Josia_Lab/
 
 ### Josia框选编辑 · 经典模式的边界框编辑器
 
-分类：`⚡️Josia实验区/框选编辑`
+分类：`⚡️Josia实验区`
 
 **它是什么。** ComfyUI 官方的「创建边界框 Create BoundingBoxes」是给 FLUX 3 / MOSS-Image 那类
 「按区域描述出图」节点喂框的，画框要靠 2.0 前端那块全屏框编辑器——经典（1.0）模式下那个控件

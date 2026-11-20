@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-josialab"
-version = "0.1.6"
-description = "JosiaNodes 实验包：与主节点包分离的独立试验田，节点可随意增删。含 Qwen-Image 2.1 加速 LoRA 适配器（JosiaQwenAccel，Fun PDD / Viggle Turbo 两条路线）与 Josia框选编辑节点（图像上画框标注、导出官方格式 JSON）。"
+version = "0.2.0"
+description = "JosiaNodes 实验包：与主节点包分离的独立试验田。含 Qwen-Image 2.1 加速 LoRA 适配器（Fun PDD / Viggle Turbo 两条路线）、Josia框选编辑（图像上画框标注、导出官方格式 JSON），以及新增的 Josia媒体中枢与媒体枢纽：中枢一个节点集中管理多路图像/视频/音频（点击或拖拽上传、缩略图/视频/波形预览、单路跳过），只输出一根媒体总线；枢纽把总线拆成独立 IMAGE/VIDEO/AUDIO 端口，省去一长排接线。"
 authors = [{ name = "Josia-doit" }]
 license = { file = "LICENSE" }
 readme = "README.md"

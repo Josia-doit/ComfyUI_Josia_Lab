@@ -64,7 +64,7 @@ except ImportError:      # 脱离 ComfyUI 环境做单测时兜底
 
 NODE_CLASS = "JosiaBBoxEdit"
 NODE_DISPLAY_NAME = "Josia框选编辑"
-NODE_CATEGORY = "⚡️Josia实验区/框选编辑"
+NODE_CATEGORY = "⚡️Josia实验区"
 
 # 底图压暗倍数，跟官方一致（官方 _PREVIEW_DIM）
 PREVIEW_DIM = 0.25
